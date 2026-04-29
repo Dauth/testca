@@ -1,0 +1,1 @@
+"""Protocol-aware bot components."""

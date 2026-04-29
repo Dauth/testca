@@ -1,0 +1,36 @@
+# Protocol-Aware Speedrun Bot Plan
+
+This folder contains the implementation plan and starter scaffolding for a fast AI/bot for this game. The design is based on verified server code, not on visual/pixel observations.
+
+Primary strategy: use deterministic protocol automation for everything the server already exposes or trusts, then reserve learning/search for combat micro only.
+
+Key verified shortcuts:
+
+- `start_time` is the RNG seed and only has to be within the server's `SeedWindow` of +/- 30 minutes.
+- `enter_door` checks only that the door exists and is unlocked; it does not check player distance.
+- `interact` uses a huge axis-aligned range of `2500` and applies the client supplied `claimed_type`, not the pickup's real type.
+- `shop_purchase` is packet-driven and has no location/shop-open check.
+- `switch_weapon` followed by `shoot` in the same server tick can fire the newly selected weapon because of `sameTickSwap`.
+- Room transitions apply a `-500 ms` bonus if the kill log duration is under 2 seconds.
+
+Files:
+
+- `AUDIT_AND_DESIGN.md`: full audit, optimization report, bot architecture, training plan, reward plan, and checklist.
+- `bot/protocol.py`: packet constants and envelope helpers.
+- `bot/world_model.py`: structured game-state cache.
+- `bot/scripted_teacher.py`: deterministic combat policy starter.
+- `bot/run_live.py`: live websocket bot loop scaffold.
+- `bot/seed_search.py`: seed ranking scaffold for legal start-time windows.
+- `training/policy_model.py`: compact PyTorch policy outline.
+- `training/train_bc.py`: behavior cloning outline.
+- `training/train_ppo.py`: PPO outline and reward notes.
+- `evaluation/evaluate.py`: batch evaluation harness outline.
+
+The live bot uses `websocket-client` if run directly:
+
+```bash
+python -m pip install websocket-client
+python automate/bot/run_live.py --url ws://localhost:8080/ws --player-id bot-local
+```
+
+For fastest offline iteration, put the eventual Go headless runner under `server/internal/...` because Go's `internal` import rule prevents code in this repo-root `automate` folder from importing `server/internal/game` directly.
