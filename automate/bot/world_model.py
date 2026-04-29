@@ -10,6 +10,8 @@ from . import protocol
 class WorldModel:
     seed: int | None = None
     current_room: int | None = None
+    room_data: dict[str, Any] = field(default_factory=dict)
+    tilemap_id: str | None = None
     player: dict[str, Any] = field(default_factory=dict)
     enemies: dict[int, dict[str, Any]] = field(default_factory=dict)
     pickups: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -82,6 +84,8 @@ class WorldModel:
             raise RuntimeError(self.last_error)
 
     def _load_room(self, room: dict[str, Any]) -> None:
+        self.room_data = room
+        self.tilemap_id = room.get("tilemap_id")
         self.current_room = room.get("room_index")
         self.enemies = {int(e["entity_id"]): e for e in room.get("enemies", [])}
         self.pickups = {int(p["entity_id"]): p for p in room.get("pickups", [])}

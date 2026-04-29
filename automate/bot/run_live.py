@@ -31,6 +31,8 @@ class LiveBot:
         self.claimed_pickups: set[int] = set()
         self.last_shot_at = 0.0
         self.last_input_log_at = 0.0
+        self.last_los_log_at = 0.0
+        self.last_action_summary: dict = {}
         self.reached_room2 = False
         self.stop_room = stop_room
         self.stop_requested = False
@@ -75,6 +77,7 @@ class LiveBot:
                         {
                             "packets": [json.loads(p) for p in packets],
                             "chosen_action": self._summarize_packets(packets),
+                            "action": self.last_action_summary,
                         },
                     )
                 time.sleep(0.05)
@@ -126,6 +129,7 @@ class LiveBot:
         return env
 
     def _decide_messages(self) -> Iterable[str]:
+        self.last_action_summary = {}
         # Remote pickup conversion: claim as coins by default. If health is low,
         # convert the next pickup to health. Ammo refills should switch weapon
         # first, then claim as ammo.
@@ -175,6 +179,15 @@ class LiveBot:
             return
 
         action = self.teacher.choose(self.world)
+        self.last_action_summary = {
+            "target_id": action.target_id,
+            "los_clear": action.los_clear,
+            "reason": action.reason,
+            "dx": action.dx,
+            "dy": action.dy,
+            "fire": action.fire,
+            "weapon_id": action.weapon_id,
+        }
         if action.weapon_id is not None and action.weapon_id != current_weapon:
             self.logger.info("switch weapon %s -> %s", current_weapon, action.weapon_id)
             yield self.proto.switch_weapon(action.weapon_id)
@@ -182,16 +195,36 @@ class LiveBot:
             now = time.time()
             if now - self.last_shot_at >= 0.2:
                 self.logger.info(
-                    "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s",
+                    "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s los_clear=%s reason=%s",
                     action.target_id,
                     action.weapon_id or current_weapon,
                     action.aim_angle,
                     len(self.world.enemies),
+                    action.los_clear,
+                    action.reason,
                 )
                 self.last_shot_at = now
             # Sending switch before shoot in the same burst exercises same-tick
             # swap/shoot behavior when both packets drain in one tick.
             yield self.proto.shoot(float(action.aim_angle))
+        elif action.target_id is not None:
+            now = time.time()
+            if now - self.last_los_log_at >= 0.5:
+                self.logger.info(
+                    "shot held target_id=%s los_clear=%s reason=%s room=%s",
+                    action.target_id,
+                    action.los_clear,
+                    action.reason,
+                    self.world.current_room,
+                )
+                if action.reason:
+                    self.logger.info(
+                        "target blocked target_id=%s reason=%s room=%s",
+                        action.target_id,
+                        action.reason,
+                        self.world.current_room,
+                    )
+                self.last_los_log_at = now
         dx, dy = normalize(action.dx, action.dy)
         now = time.time()
         if now - self.last_input_log_at >= 1.0:
