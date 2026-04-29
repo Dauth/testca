@@ -106,6 +106,17 @@ class ParsedRoom:
                 return False
         return True
 
+    def line_crosses_water(self, ax: float, ay: float, bx: float, by: float) -> bool:
+        dist = math.hypot(bx - ax, by - ay)
+        steps = max(1, int(dist / 8.0))
+        for i in range(1, steps + 1):
+            t = i / steps
+            x = ax + (bx - ax) * t
+            y = ay + (by - ay) * t
+            if self._cell_at(x, y) == CELL_WATER:
+                return True
+        return False
+
     def direction_to_line_of_fire(
         self, ax: float, ay: float, bx: float, by: float
     ) -> tuple[float, float] | None:
@@ -283,6 +294,9 @@ class ParsedRoom:
                     continue
             out.append(nxt)
         return out
+
+    def escape_space(self, cell: tuple[int, int]) -> int:
+        return sum(1 for nxt in self._neighbors(cell) if self._walkable_cell(nxt))
 
     def _neighbor_cells(self, cell: tuple[int, int]) -> list[tuple[int, int]]:
         col, row = cell

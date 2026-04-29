@@ -30,7 +30,7 @@ class LiveBot:
         log_dir: str = "automate/runs",
         stop_room: int = 0,
         walk_to_door: bool = True,
-        door_enter_distance: float = 58.0,
+        door_enter_distance: float = 48.0,
         pickup_mode: str = "physical",
         pickup_interact_distance: float = PICKUP_INTERACT_DISTANCE,
     ):
@@ -218,20 +218,22 @@ class LiveBot:
             yield self.proto.interact(pickup_id, pickup_type)
 
         # Direct shop purchases. Spend toward combat speed first; ammo only when
-        # the active limited-ammo weapon is low.
-        coins = int(self.world.player.get("coins", 0) or 0)
-        for item_id, cost in (
-            (protocol.SHOP_DAMAGE, 20),
-            (protocol.SHOP_FIRE_RATE, 15),
-            (protocol.SHOP_SPEED, 10),
-            (protocol.SHOP_AMMO, 5),
-        ):
-            while coins >= cost:
-                if item_id == protocol.SHOP_AMMO and ammo > 3:
-                    break
-                coins -= cost
-                self.logger.info("shop purchase sent item_id=%s remaining_estimated_coins=%s", item_id, coins)
-                yield self.proto.shop_purchase(item_id)
+        # the active limited-ammo weapon is low. In physical modes, avoid
+        # invisible protocol-only upgrades so the visible run reflects movement.
+        if self.pickup_mode == "remote":
+            coins = int(self.world.player.get("coins", 0) or 0)
+            for item_id, cost in (
+                (protocol.SHOP_DAMAGE, 20),
+                (protocol.SHOP_FIRE_RATE, 15),
+                (protocol.SHOP_SPEED, 10),
+                (protocol.SHOP_AMMO, 5),
+            ):
+                while coins >= cost:
+                    if item_id == protocol.SHOP_AMMO and ammo > 3:
+                        break
+                    coins -= cost
+                    self.logger.info("shop purchase sent item_id=%s remaining_estimated_coins=%s", item_id, coins)
+                    yield self.proto.shop_purchase(item_id)
 
         door_id = self.world.best_unlocked_door()
         if door_id is not None:
@@ -418,11 +420,18 @@ class LiveBot:
         pickup = self.world.pickups.get(int(pickup_id)) or {}
         actual_type = int(pickup.get("type", protocol.PICKUP_COIN) or protocol.PICKUP_COIN)
         if self.pickup_mode == "remote":
-            if hp <= LOW_HEALTH_THRESHOLD:
-                return protocol.PICKUP_HEALTH, "low_hp_remote"
-            if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
-                return protocol.PICKUP_AMMO, "low_ammo_remote"
-            return protocol.PICKUP_COIN, "coin_remote"
+            if actual_type == protocol.PICKUP_HEALTH and hp <= LOW_HEALTH_THRESHOLD:
+                return actual_type, "low_hp_remote"
+            if (
+                actual_type == protocol.PICKUP_AMMO
+                and not self.world.enemies
+                and current_weapon in (2, 3)
+                and ammo <= LOW_AMMO_THRESHOLD
+            ):
+                return actual_type, "low_ammo_remote"
+            if actual_type == protocol.PICKUP_COIN:
+                return actual_type, "coin_remote"
+            return None, "skip_remote_not_needed"
 
         if not self._near_pickup(pickup_id):
             return None, "not_near_pickup"
@@ -430,11 +439,17 @@ class LiveBot:
         if actual_type == protocol.PICKUP_HEALTH:
             if hp <= LOW_HEALTH_THRESHOLD:
                 return actual_type, "low_hp"
+            if self.world.enemies:
+                return None, "skip_health_combat_not_low"
             return actual_type, "health_near"
         if actual_type == protocol.PICKUP_AMMO:
+            if self.world.enemies:
+                return None, "skip_ammo_combat"
             if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
                 return actual_type, "low_ammo"
-            return actual_type, "ammo_near"
+            if self._pickup_on_way(pickup_id):
+                return actual_type, "ammo_on_way_safe"
+            return None, "skip_ammo_not_needed"
         if actual_type == protocol.PICKUP_COIN:
             if self.pickup_mode == "on-way" and not self._pickup_on_way(pickup_id):
                 return None, "coin_off_path"
@@ -650,7 +665,7 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-room", type=int, default=0)
     parser.add_argument("--no-walk-to-door", action="store_true")
-    parser.add_argument("--door-enter-distance", type=float, default=58.0)
+    parser.add_argument("--door-enter-distance", type=float, default=48.0)
     parser.add_argument("--pickup-mode", choices=("physical", "on-way", "remote"), default="physical")
     parser.add_argument("--pickup-interact-distance", type=float, default=PICKUP_INTERACT_DISTANCE)
     args = parser.parse_args()

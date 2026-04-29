@@ -36,6 +36,6 @@ automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/
 automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/ws --player-id bot-local --verbose --stop-room 4 --pickup-mode on-way
 ```
 
-Door walking is now the default so the browser view shows the bot physically moving to the unlocked door. Use `--no-walk-to-door` to test the faster protocol shortcut. Pickup mode defaults to `remote`; `--pickup-mode on-way` limits coin pickup claims to nearby/path pickups while still prioritizing low-health and low-ammo recovery.
+Door walking is now the default so the browser view shows the bot physically moving to the unlocked door. Use `--no-walk-to-door` to test the faster protocol shortcut. Pickup mode defaults to `physical`; use `--pickup-mode remote` only for exploit/speedrun testing. `--pickup-mode on-way` keeps physical interaction but limits coin pickup claims to nearby/path pickups while still allowing low-health recovery.
 
 For fastest offline iteration, put the eventual Go headless runner under `server/internal/...` because Go's `internal` import rule prevents code in this repo-root `automate` folder from importing `server/internal/game` directly.

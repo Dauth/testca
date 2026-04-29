@@ -17,10 +17,18 @@ TILE_SIZE = 32.0
 MIN_SHOOT_DISTANCE = TILE_SIZE * 5.0
 EMERGENCY_SHOOT_DISTANCE = TILE_SIZE * 4.0
 PREFERRED_FIRE_DISTANCE = 190.0
+IDEAL_FIRE_MIN = 160.0
+IDEAL_FIRE_MAX = 260.0
 MAX_SHOOT_DISTANCE = 420.0
 PROJECTILE_SPEED = 600.0
 SHOTGUN_EFFECTIVE_RANGE = 210.0
 LONG_WEAPON_EFFECTIVE_RANGE = 900.0
+TARGET_SWITCH_ADVANTAGE = 64.0
+DOOR_TARGET_SWITCH_ADVANTAGE = 96.0
+RIVER_DOOR_CLOSE_DISTANCE = 260.0
+GOAL_REACHED_DISTANCE = 24.0
+GOAL_LOCK_TICKS = 18
+STUCK_TICKS_FOR_REPLAN = 8
 
 ENEMY_THREAT = {
     1: 1.0,  # grunt
@@ -66,16 +74,33 @@ class ScriptedTeacher:
         self.geometry = RoomGeometry(repo_root)
         self.blocked_target_id: int | None = None
         self.blocked_target_ticks = 0
+        self.current_target_id: int | None = None
+        self.current_goal_cell: tuple[int, int] | None = None
+        self.goal_target_id: int | None = None
+        self.goal_expires_at_tick = 0
+        self.last_move: tuple[float, float] = (0.0, 0.0)
+        self.last_position: tuple[float, float] | None = None
+        self.stuck_ticks = 0
+        self.tick = 0
+        self.current_room: int | None = None
 
     def choose(self, world: WorldModel) -> Action:
+        self.tick += 1
+        if world.current_room != self.current_room:
+            self.current_room = world.current_room
+            self._clear_locks()
+
         player = world.player
         if not player or not world.enemies:
+            self._clear_locks(clear_target=True)
             return Action()
 
         px = float(player.get("x", 640.0))
         py = float(player.get("y", 384.0))
+        self._update_stuck(px, py)
         target, los_clear = self.choose_target(world, px, py)
         if target is None:
+            self._clear_locks(clear_target=True)
             return Action()
         if los_clear:
             self.blocked_target_id = None
@@ -84,7 +109,11 @@ class ScriptedTeacher:
         target_dist = distance(px, py, float(target["x"]), float(target["y"]))
         weapon = self.choose_weapon(world, target, px, py) if los_clear else None
         max_range = min(weapon_effective_range(weapon), MAX_SHOOT_DISTANCE)
-        range_ok = MIN_SHOOT_DISTANCE <= target_dist <= max_range
+        closer_tile_exists = False
+        if los_clear and target_dist > IDEAL_FIRE_MAX:
+            closer_tile_exists = self.has_better_firing_tile(world, px, py, target, target_dist)
+        river_door_shot = self.river_door_opportunity(world, px, py, target) if los_clear else False
+        range_ok = target_dist <= max_range
         emergency_close = los_clear and target_dist <= EMERGENCY_SHOOT_DISTANCE
         aim = self.predictive_aim(world, px, py, target)
         dx, dy = self.choose_movement(world, px, py, target, los_clear, range_ok)
@@ -93,16 +122,21 @@ class ScriptedTeacher:
         elif emergency_close:
             reason = "emergency_close_threat"
         elif target_dist < MIN_SHOOT_DISTANCE:
-            reason = "back_up_to_5_steps"
-        elif target_dist > max_range:
+            reason = "route_to_safe_firing_tile"
+        elif river_door_shot:
+            reason = "shoot_across_river_to_door"
+        elif closer_tile_exists:
+            reason = "move_closer_to_firing_band"
+        elif target_dist > min(IDEAL_FIRE_MAX, max_range):
             reason = "close_distance"
         else:
             reason = "visible_target"
+        self.last_move = (dx, dy)
         return Action(
             dx=dx,
             dy=dy,
             aim_angle=aim,
-            fire=los_clear and (range_ok or emergency_close),
+            fire=los_clear and range_ok,
             weapon_id=weapon,
             target_id=int(target["entity_id"]),
             los_clear=los_clear,
@@ -119,23 +153,64 @@ class ScriptedTeacher:
         if not enemies:
             return None, False
 
-        nearest_dist = min(
-            distance(px, py, float(enemy["x"]), float(enemy["y"]))
-            for enemy in enemies
+        closest = min(
+            enemies,
+            key=lambda enemy: distance(px, py, float(enemy["x"]), float(enemy["y"])),
         )
-        nearest_band = [
-            enemy
-            for enemy in enemies
-            if distance(px, py, float(enemy["x"]), float(enemy["y"])) <= nearest_dist + TILE_SIZE
-        ]
-        target = min(
-            nearest_band,
-            key=lambda enemy: (
-                int(enemy.get("hp", 1) or 1),
-                distance(px, py, float(enemy["x"]), float(enemy["y"])),
-                int(enemy.get("entity_id", 0) or 0),
-            ),
-        )
+        closest_dist = distance(px, py, float(closest["x"]), float(closest["y"]))
+        if closest_dist <= EMERGENCY_SHOOT_DISTANCE:
+            preferred = closest
+        else:
+            door = self.known_door_point(world)
+            if door is None:
+                nearest_dist = min(
+                    distance(px, py, float(enemy["x"]), float(enemy["y"]))
+                    for enemy in enemies
+                )
+                nearest_band = [
+                    enemy
+                    for enemy in enemies
+                    if distance(px, py, float(enemy["x"]), float(enemy["y"])) <= nearest_dist + TILE_SIZE
+                ]
+                preferred = min(
+                    nearest_band,
+                    key=lambda enemy: (
+                        int(enemy.get("hp", 1) or 1),
+                        distance(px, py, float(enemy["x"]), float(enemy["y"])),
+                        int(enemy.get("entity_id", 0) or 0),
+                    ),
+                )
+            else:
+                preferred = max(
+                    enemies,
+                    key=lambda enemy: (
+                        distance(float(enemy["x"]), float(enemy["y"]), door[0], door[1]),
+                        -int(enemy.get("hp", 1) or 1),
+                        -distance(px, py, float(enemy["x"]), float(enemy["y"])),
+                        -int(enemy.get("entity_id", 0) or 0),
+                    ),
+                )
+        target = preferred
+        locked = world.enemies.get(self.current_target_id or -1)
+        if locked is not None:
+            locked_dist = distance(px, py, float(locked["x"]), float(locked["y"]))
+            preferred_dist = distance(px, py, float(preferred["x"]), float(preferred["y"]))
+            emergency = preferred_dist <= EMERGENCY_SHOOT_DISTANCE and int(preferred["entity_id"]) != self.current_target_id
+            much_closer = preferred_dist <= locked_dist - TARGET_SWITCH_ADVANTAGE
+            door = self.known_door_point(world)
+            much_farther_from_door = False
+            if door is not None and int(preferred["entity_id"]) != self.current_target_id:
+                preferred_door_dist = distance(float(preferred["x"]), float(preferred["y"]), door[0], door[1])
+                locked_door_dist = distance(float(locked["x"]), float(locked["y"]), door[0], door[1])
+                much_farther_from_door = preferred_door_dist >= locked_door_dist + DOOR_TARGET_SWITCH_ADVANTAGE
+            blocked_too_long = (
+                self.blocked_target_id == self.current_target_id
+                and self.blocked_target_ticks >= 35
+                and int(preferred["entity_id"]) != self.current_target_id
+            )
+            if not emergency and not much_closer and not much_farther_from_door and not blocked_too_long:
+                target = locked
+        self.current_target_id = int(target["entity_id"])
         los_clear = room.line_of_fire_clear(px, py, float(target["x"]), float(target["y"]))
         return target, los_clear
 
@@ -180,8 +255,25 @@ class ScriptedTeacher:
         tx = float(target["x"]) - px
         ty = float(target["y"]) - py
         tdist = max(1.0, math.hypot(tx, ty))
-        if tdist < MIN_SHOOT_DISTANCE:
-            return self.escape_close_threats(world, px, py, target)
+        if self.river_door_opportunity(world, px, py, target):
+            routed = self.route_to_door(world, px, py)
+            if routed is not None:
+                self.current_goal_cell = None
+                return routed
+
+        if tdist < MIN_SHOOT_DISTANCE or tdist > IDEAL_FIRE_MAX:
+            routed = self.route_to_safe_firing_position(
+                world,
+                self.geometry.load_room(int(world.current_room or 1)),
+                px,
+                py,
+                float(target["x"]),
+                float(target["y"]),
+            )
+            if routed is not None:
+                return routed
+            if tdist < MIN_SHOOT_DISTANCE:
+                return self.escape_close_threats(world, px, py, target)
 
         vx = 0.0
         vy = 0.0
@@ -196,22 +288,13 @@ class ScriptedTeacher:
                 vx += dx / dist * weight
                 vy += dy / dist * weight
 
-        # Keep pressure on the target without breaking the five-step spacing.
+        # Keep pressure on the selected target; firing can continue while moving.
         if tdist > PREFERRED_FIRE_DISTANCE + 35.0:
             vx += tx / tdist * 0.7
             vy += ty / tdist * 0.7
         elif not range_ok:
             vx += tx / tdist * 0.7
             vy += ty / tdist * 0.7
-
-        door = self.known_door_point(world)
-        if door is not None and tdist >= MIN_SHOOT_DISTANCE:
-            ddx = door[0] - px
-            ddy = door[1] - py
-            dmag = math.hypot(ddx, ddy)
-            if dmag > 1e-6:
-                vx += ddx / dmag * 0.25
-                vy += ddy / dmag * 0.25
 
         mag = math.hypot(vx, vy)
         if mag < 1e-6:
@@ -230,6 +313,10 @@ class ScriptedTeacher:
         else:
             self.blocked_target_id = target_id
             self.blocked_target_ticks = 1
+
+        routed = self.route_to_line_of_fire_position(world, room, px, py, tx, ty)
+        if routed is not None:
+            return routed
 
         if self.blocked_target_ticks >= 12:
             routed_to_target = room.direction_to_reachable_near_point(
@@ -302,6 +389,79 @@ class ScriptedTeacher:
                 best = (dx, dy)
 
         return best
+
+    def route_to_line_of_fire_position(
+        self,
+        world: WorldModel,
+        room: Any,
+        px: float,
+        py: float,
+        tx: float,
+        ty: float,
+    ) -> tuple[float, float] | None:
+        start = room._nearest_walkable_cell(px, py)
+        target_id = self.current_target_id
+        if start is None:
+            return None
+        if (
+            self.current_goal_cell is not None
+            and self.goal_target_id == target_id
+            and self.stuck_ticks < STUCK_TICKS_FOR_REPLAN
+            and self._los_goal_cell_valid(world, room, self.current_goal_cell, tx, ty)
+        ):
+            gx, gy = room._cell_center(self.current_goal_cell)
+            if distance(px, py, gx, gy) > GOAL_REACHED_DISTANCE:
+                routed = self._direction_to_cell(room, px, py, self.current_goal_cell)
+                if routed is not None:
+                    return routed
+
+        q = deque([start])
+        parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        best: tuple[int, int] | None = None
+        best_score = float("-inf")
+
+        while q:
+            cell = q.popleft()
+            cx, cy = room._cell_center(cell)
+            if room.line_of_fire_clear(cx, cy, tx, ty):
+                target_dist = distance(cx, cy, tx, ty)
+                escape_space = room.escape_space(cell)
+                nearest_enemy = min(
+                    (
+                        distance(cx, cy, float(enemy["x"]), float(enemy["y"]))
+                        for enemy in world.enemies.values()
+                    ),
+                    default=999.0,
+                )
+                score = 2000.0
+                score -= abs(target_dist - PREFERRED_FIRE_DISTANCE) * 4.0
+                if target_dist < EMERGENCY_SHOOT_DISTANCE:
+                    score -= (EMERGENCY_SHOOT_DISTANCE - target_dist) * 24.0
+                score += min(nearest_enemy, 260.0) * 2.0
+                score += escape_space * 70.0
+                if escape_space <= 2:
+                    score -= 700.0
+                score -= self.wall_pressure(room, cx, cy) * 100.0
+                # Prefer goals that are not just one side-step away from the
+                # blocked sightline; room 7 needs commitment around the wall.
+                score += min(distance(px, py, cx, cy), 260.0) * 0.35
+                if cell != start and score > best_score:
+                    best_score = score
+                    best = cell
+
+            for nxt in room._neighbors(cell):
+                if nxt in parent:
+                    continue
+                parent[nxt] = cell
+                q.append(nxt)
+
+        if best is None:
+            self.current_goal_cell = None
+            return None
+        self.current_goal_cell = best
+        self.goal_target_id = target_id
+        self.goal_expires_at_tick = self.tick + GOAL_LOCK_TICKS
+        return self._direction_to_cell(room, px, py, best)
 
     def escape_close_threats(
         self, world: WorldModel, px: float, py: float, target: dict[str, Any]
@@ -377,13 +537,27 @@ class ScriptedTeacher:
         start = room._nearest_walkable_cell(px, py)
         if start is None:
             return None
+        target_id = self.current_target_id
+        if (
+            self.current_goal_cell is not None
+            and self.goal_target_id == target_id
+            and self.stuck_ticks < STUCK_TICKS_FOR_REPLAN
+            and self._goal_cell_valid(world, room, self.current_goal_cell, tx, ty)
+        ):
+            gx, gy = room._cell_center(self.current_goal_cell)
+            if distance(px, py, gx, gy) > GOAL_REACHED_DISTANCE:
+                routed = self._direction_to_cell(room, px, py, self.current_goal_cell)
+                if routed is not None:
+                    return routed
+
+        self.current_goal_cell = None
 
         q = deque([start])
         parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
         best: tuple[int, int] | None = None
         best_score = float("-inf")
 
-        while q and len(parent) < 520:
+        while q and len(parent) < 1200:
             cell = q.popleft()
             cx, cy = room._cell_center(cell)
             target_dist = distance(cx, cy, tx, ty)
@@ -394,23 +568,27 @@ class ScriptedTeacher:
                 ),
                 default=999.0,
             )
+            escape_space = room.escape_space(cell)
+            los_clear = room.line_of_fire_clear(cx, cy, tx, ty)
 
             score = 0.0
-            if target_dist >= MIN_SHOOT_DISTANCE + 16.0:
-                score += 2000.0
+            if los_clear:
+                score += 1000.0
+            if IDEAL_FIRE_MIN <= target_dist <= 240.0:
+                score += 800.0
             else:
-                score -= (MIN_SHOOT_DISTANCE + 16.0 - target_dist) * 20.0
-            score -= abs(target_dist - PREFERRED_FIRE_DISTANCE) * 5.0
+                score -= abs(target_dist - PREFERRED_FIRE_DISTANCE) * 6.0
+            if target_dist < MIN_SHOOT_DISTANCE:
+                score -= (MIN_SHOOT_DISTANCE - target_dist) * 24.0
+            if target_dist >= MIN_SHOOT_DISTANCE + 16.0:
+                score += 400.0
             score += min(nearest_enemy, 280.0) * 3.0
             if nearest_enemy < MIN_SHOOT_DISTANCE:
                 score -= (MIN_SHOOT_DISTANCE - nearest_enemy) * 18.0
-            if room.line_of_fire_clear(cx, cy, tx, ty):
-                score += 700.0
-            score -= self.wall_pressure(room, cx, cy) * 70.0
-
-            door = self.known_door_point(world)
-            if door is not None:
-                score -= distance(cx, cy, door[0], door[1]) * 0.05
+            score += escape_space * 80.0
+            if escape_space <= 2:
+                score -= 850.0
+            score -= self.wall_pressure(room, cx, cy) * 120.0
 
             if cell != start and score > best_score:
                 best_score = score
@@ -424,6 +602,9 @@ class ScriptedTeacher:
 
         if best is None:
             return None
+        self.current_goal_cell = best
+        self.goal_target_id = target_id
+        self.goal_expires_at_tick = self.tick + GOAL_LOCK_TICKS
 
         step = best
         while parent.get(step) is not None and parent[step] != start:
@@ -436,6 +617,163 @@ class ScriptedTeacher:
         if mag < 1e-6:
             return None
         return dx / mag, dy / mag
+
+    def has_better_firing_tile(
+        self,
+        world: WorldModel,
+        px: float,
+        py: float,
+        target: dict[str, Any],
+        current_dist: float,
+    ) -> bool:
+        room = self.geometry.load_room(int(world.current_room or 1))
+        start = room._nearest_walkable_cell(px, py)
+        if start is None:
+            return False
+        tx = float(target["x"])
+        ty = float(target["y"])
+        door = self.known_door_point(world)
+        current_door_dist = distance(px, py, door[0], door[1]) if door is not None else 0.0
+        q = deque([start])
+        seen = {start}
+        while q and len(seen) < 420:
+            cell = q.popleft()
+            cx, cy = room._cell_center(cell)
+            target_dist = distance(cx, cy, tx, ty)
+            if (
+                target_dist <= current_dist - TILE_SIZE
+                and target_dist >= MIN_SHOOT_DISTANCE
+                and room.line_of_fire_clear(cx, cy, tx, ty)
+                and room.escape_space(cell) > 2
+                and self.wall_pressure(room, cx, cy) < 9.0
+            ):
+                if door is None or distance(cx, cy, door[0], door[1]) <= current_door_dist + 96.0:
+                    return True
+            for nxt in room._neighbors(cell):
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                q.append(nxt)
+        return False
+
+    def river_door_opportunity(
+        self, world: WorldModel, px: float, py: float, target: dict[str, Any]
+    ) -> bool:
+        door = self.known_door_point(world)
+        if door is None:
+            return False
+        tx = float(target["x"])
+        ty = float(target["y"])
+        target_dist = distance(px, py, tx, ty)
+        if target_dist > MAX_SHOOT_DISTANCE or target_dist < MIN_SHOOT_DISTANCE:
+            return False
+        door_dist = distance(px, py, door[0], door[1])
+        if door_dist > RIVER_DOOR_CLOSE_DISTANCE:
+            return False
+        room = self.geometry.load_room(int(world.current_room or 1))
+        return room.line_of_fire_clear(px, py, tx, ty) and room.line_crosses_water(px, py, tx, ty)
+
+    def route_to_door(
+        self, world: WorldModel, px: float, py: float
+    ) -> tuple[float, float] | None:
+        door = self.known_door_point(world)
+        if door is None:
+            return None
+        room = self.geometry.load_room(int(world.current_room or 1))
+        routed = room.direction_to_reachable_near_point(px, py, door[0], door[1], 40.0)
+        if routed is None:
+            routed = room.direction_to_point(px, py, door[0], door[1])
+        if routed is None:
+            return None
+        return normalize_pair(*routed)
+
+    def _goal_cell_valid(
+        self,
+        world: WorldModel,
+        room: Any,
+        cell: tuple[int, int],
+        tx: float,
+        ty: float,
+    ) -> bool:
+        if not room._walkable_cell(cell):
+            return False
+        cx, cy = room._cell_center(cell)
+        if room.escape_space(cell) <= 2:
+            return False
+        if self.wall_pressure(room, cx, cy) >= 10.0:
+            return False
+        target_dist = distance(cx, cy, tx, ty)
+        if target_dist < MIN_SHOOT_DISTANCE:
+            return False
+        nearest_enemy = min(
+            (
+                distance(cx, cy, float(enemy["x"]), float(enemy["y"]))
+                for enemy in world.enemies.values()
+            ),
+            default=999.0,
+        )
+        return nearest_enemy >= EMERGENCY_SHOOT_DISTANCE
+
+    def _los_goal_cell_valid(
+        self,
+        world: WorldModel,
+        room: Any,
+        cell: tuple[int, int],
+        tx: float,
+        ty: float,
+    ) -> bool:
+        if not self._goal_cell_valid(world, room, cell, tx, ty):
+            return False
+        cx, cy = room._cell_center(cell)
+        return room.line_of_fire_clear(cx, cy, tx, ty)
+
+    def _direction_to_cell(
+        self, room: Any, px: float, py: float, goal: tuple[int, int]
+    ) -> tuple[float, float] | None:
+        start = room._nearest_walkable_cell(px, py)
+        if start is None or start == goal:
+            return None
+        q = deque([start])
+        parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        while q:
+            cell = q.popleft()
+            if cell == goal:
+                break
+            for nxt in room._neighbors(cell):
+                if nxt in parent:
+                    continue
+                parent[nxt] = cell
+                q.append(nxt)
+        if goal not in parent:
+            return None
+        step = goal
+        while parent.get(step) is not None and parent[step] != start:
+            step = parent[step]  # type: ignore[assignment]
+        sx, sy = room._cell_center(step)
+        return normalize_pair(sx - px, sy - py)
+
+    def _update_stuck(self, px: float, py: float) -> None:
+        if self.last_position is None:
+            self.last_position = (px, py)
+            return
+        moved = distance(px, py, self.last_position[0], self.last_position[1])
+        intended = math.hypot(self.last_move[0], self.last_move[1])
+        if intended > 0.2 and moved < 3.0:
+            self.stuck_ticks += 1
+        else:
+            self.stuck_ticks = 0
+        self.last_position = (px, py)
+        if self.stuck_ticks >= STUCK_TICKS_FOR_REPLAN:
+            self.current_goal_cell = None
+
+    def _clear_locks(self, clear_target: bool = False) -> None:
+        if clear_target:
+            self.current_target_id = None
+        self.current_goal_cell = None
+        self.goal_target_id = None
+        self.goal_expires_at_tick = 0
+        self.blocked_target_id = None
+        self.blocked_target_ticks = 0
 
     def known_door_point(self, world: WorldModel) -> tuple[float, float] | None:
         if not world.doors:
