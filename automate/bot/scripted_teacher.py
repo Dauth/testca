@@ -77,6 +77,9 @@ class ScriptedTeacher:
         target, los_clear = self.choose_target(world, px, py)
         if target is None:
             return Action()
+        if los_clear:
+            self.blocked_target_id = None
+            self.blocked_target_ticks = 0
 
         target_dist = distance(px, py, float(target["x"]), float(target["y"]))
         weapon = self.choose_weapon(world, target, px, py) if los_clear else None
