@@ -22,10 +22,11 @@ LOW_HEALTH_THRESHOLD = 45
 LOW_AMMO_THRESHOLD = 3
 COIN_NEAR_DISTANCE = 140.0
 COIN_PATH_DISTANCE = 96.0
-COIN_ROUTE_NEAR_DISTANCE = 180.0
-COIN_ROUTE_MAX_DETOUR = 220.0
-COIN_ROUTE_MAX_NEEDED = 3
+COIN_ROUTE_NEAR_DISTANCE = 140.0
+COIN_ROUTE_MAX_DETOUR = 96.0
+COIN_ROUTE_MAX_NEEDED = 1
 PICKUP_INTERACT_DISTANCE = 48.0
+WEAPON_RIFLE = 2
 WEAPON_SHOTGUN = 3
 BIG_CAT_TYPES = {3, 5}
 
@@ -52,6 +53,7 @@ class LiveBot:
         self.geometry = RoomGeometry(Path(__file__).resolve().parents[2])
         self.coin_planner = CoinPlanner(self.geometry)
         self.claimed_pickups: set[int] = set()
+        self.ammo_shop_rooms: set[int] = set()
         self.last_shot_at = 0.0
         self.last_input_log_at = 0.0
         self.last_los_log_at = 0.0
@@ -205,7 +207,8 @@ class LiveBot:
                         action.reason,
                     )
                     self.last_shot_at = now
-                yield self.proto.shoot(float(action.aim_angle))
+                for msg in self._shoot_messages(action, current_weapon):
+                    yield msg
             self.logger.info(
                 "move_to_pickup id=%s type=%s reason=%s distance=%.1f dx=%.3f dy=%.3f",
                 priority_pickup,
@@ -244,6 +247,8 @@ class LiveBot:
                     self.logger.info("switch weapon %s -> %s for shotgun ammo pickup", current_weapon, WEAPON_SHOTGUN)
                     self.teacher.empty_weapons.discard(WEAPON_SHOTGUN)
                     yield self.proto.switch_weapon(WEAPON_SHOTGUN)
+                self.teacher.empty_weapons.discard(WEAPON_RIFLE)
+                self.teacher.empty_weapons.discard(WEAPON_SHOTGUN)
             else:
                 self.logger.info("pickup seen id=%s claim=coin reason=%s", pickup_id, pickup_reason)
             self.last_action_summary = {
@@ -266,7 +271,9 @@ class LiveBot:
 
         # Shop is a menu/protocol action, unlike physical pickups and doors.
         # Send purchases opportunistically; they do not require physical walking.
-        shop_purchases = self._safe_shop_purchases(hp, ammo, current_weapon)
+        shop_purchases = []
+        if self.world.current_room != 10 or self.world.enemies:
+            shop_purchases = self._safe_shop_purchases(hp, ammo, current_weapon)
         if shop_purchases:
             self.last_action_summary = {
                 "objective_type": "shop",
@@ -387,9 +394,8 @@ class LiveBot:
                     action.reason,
                 )
                 self.last_shot_at = now
-            # Sending switch before shoot in the same burst exercises same-tick
-            # swap/shoot behavior when both packets drain in one tick.
-            yield self.proto.shoot(float(action.aim_angle))
+            for msg in self._shoot_messages(action, current_weapon):
+                yield msg
         elif action.target_id is not None:
             now = time.time()
             if now - self.last_los_log_at >= 0.5:
@@ -425,6 +431,7 @@ class LiveBot:
             self.logger.info("auth ok received display_name=%s", data.get("display_name"))
         elif typ == protocol.S2C_RUN_STARTED:
             self.claimed_pickups.clear()
+            self.ammo_shop_rooms.clear()
             room = data.get("room") or {}
             self.logger.info(
                 "run started seed=%s room=%s enemies=%s pickups=%s doors=%s",
@@ -495,6 +502,41 @@ class LiveBot:
 
     def _summarize_packets(self, packets: list[str]) -> list[str]:
         return [protocol.packet_name(json.loads(packet).get("type")) for packet in packets]
+
+    def _shoot_messages(self, action, current_weapon: int) -> list[str]:
+        """Fire a same-tick multi-weapon volley.
+
+        The server stores cooldown per weapon and allows shoot immediately after
+        a switch processed in the same engine drain. Sending the volley every
+        control tick lets the server accept whichever weapons are off cooldown.
+        """
+        weapons: list[int] = []
+        if action.weapon_id is not None:
+            weapons.append(int(action.weapon_id))
+        if (
+            action.distance_to_target <= 650.0
+            and WEAPON_RIFLE not in self.teacher.empty_weapons
+        ):
+            weapons.append(WEAPON_RIFLE)
+        if (
+            action.distance_to_target <= 230.0
+            and WEAPON_SHOTGUN not in self.teacher.empty_weapons
+        ):
+            weapons.append(WEAPON_SHOTGUN)
+        weapons.append(1)
+
+        messages: list[str] = []
+        active = current_weapon
+        seen: set[int] = set()
+        for weapon in weapons:
+            if weapon in seen:
+                continue
+            seen.add(weapon)
+            if weapon != active:
+                messages.append(self.proto.switch_weapon(weapon))
+                active = weapon
+            messages.append(self.proto.shoot(float(action.aim_angle)))
+        return messages
 
     def _pickup_claim(
         self, pickup_id: int, hp: int, ammo: int, current_weapon: int
@@ -689,7 +731,7 @@ class LiveBot:
         damage = int(player.get("damage_stacks", 0) or 0)
         room = int(self.world.current_room or 1)
         no_enemies = not self.world.enemies
-        limited_ammo_low = current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD
+        limited_ammo_low = self._limited_ammo_low_for_final(ammo, current_weapon)
         purchases: list[int] = []
 
         def buy(item_id: int, cost: int) -> bool:
@@ -700,37 +742,74 @@ class LiveBot:
             purchases.append(item_id)
             return True
 
-        if no_enemies and room >= 9 and limited_ammo_low:
-            buy(protocol.SHOP_AMMO, 5)
+        def buy_ammo_once() -> bool:
+            if room != 10 and room in self.ammo_shop_rooms:
+                return False
+            if buy(protocol.SHOP_AMMO, 5):
+                if room != 10:
+                    self.ammo_shop_rooms.add(room)
+                self.teacher.empty_weapons.discard(WEAPON_RIFLE)
+                self.teacher.empty_weapons.discard(WEAPON_SHOTGUN)
+                return True
+            return False
+
+        # Limited ammo is far more valuable than one more movement stack once
+        # the mid-game heavies appear. The shop action is instant/menu-based, so
+        # refill as soon as the teacher has proven rifle or shotgun empty.
+        limited_weapon_known_empty = bool(
+            self.teacher.empty_weapons.intersection({WEAPON_RIFLE, WEAPON_SHOTGUN})
+        )
+        if room == 10 and limited_weapon_known_empty:
+            buy_ammo_once()
+        elif room >= 5 and (limited_weapon_known_empty or limited_ammo_low):
+            buy_ammo_once()
+        elif room >= 9 and (no_enemies or room == 10 or limited_ammo_low):
+            buy_ammo_once()
 
         while speed < 2 and buy(protocol.SHOP_SPEED, 10):
-            speed += 1
-
-        while fire_rate < 3 and buy(protocol.SHOP_FIRE_RATE, 15):
-            fire_rate += 1
-
-        while speed < 4 and buy(protocol.SHOP_SPEED, 10):
             speed += 1
 
         while fire_rate < 5 and buy(protocol.SHOP_FIRE_RATE, 15):
             fire_rate += 1
 
+        if room >= 9 and (no_enemies or room == 10 or limited_ammo_low):
+            buy_ammo_once()
+
+        # Do not drain 10-coin chunks on extra speed while we are still saving
+        # for the first real DPS upgrades.
+        if fire_rate < 3:
+            return purchases
+
+        while speed < 3 and buy(protocol.SHOP_SPEED, 10):
+            speed += 1
+
+        if fire_rate < 5:
+            return purchases
+
+        while speed < 4 and buy(protocol.SHOP_SPEED, 10):
+            speed += 1
+
         while self._next_damage_stack_useful(damage) and buy(protocol.SHOP_DAMAGE, 20):
             damage += 1
 
         if no_enemies and limited_ammo_low:
-            buy(protocol.SHOP_AMMO, 5)
+            buy_ammo_once()
 
         return purchases
 
     def _priority_coin_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
         if self.pickup_mode == "remote" or hp <= LOW_HEALTH_THRESHOLD:
             return None
+        if self.world.enemies:
+            return None
+        room = int(self.world.current_room or 1)
+        if room < 9 or room == 10:
+            return None
         needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
         nearest_enemy = self._nearest_enemy_distance()
-        if self.world.enemies and nearest_enemy < 260.0:
+        if nearest_enemy < 260.0:
             return None
-        if needed <= 0 and self.world.enemies:
+        if needed <= 0:
             return None
         if needed > COIN_ROUTE_MAX_NEEDED:
             return None
@@ -746,6 +825,10 @@ class LiveBot:
                 int(pickup["entity_id"]), hp, ammo, current_weapon
             ).priority,
         )
+        if self._pickup_distance(int(target["entity_id"])) > COIN_ROUTE_NEAR_DISTANCE:
+            return None
+        if self._coin_detour_cost(int(target["entity_id"])) > COIN_ROUTE_MAX_DETOUR:
+            return None
         return int(target["entity_id"])
 
     def _coin_route_candidates(self, hp: int, ammo: int, current_weapon: int) -> list[dict]:
@@ -828,23 +911,30 @@ class LiveBot:
         damage = int(player.get("damage_stacks", 0) or 0)
         room = int(self.world.current_room or 1)
         no_enemies = not self.world.enemies
-        limited_ammo_low = current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD
+        limited_ammo_low = self._limited_ammo_low_for_final(ammo, current_weapon)
 
-        if no_enemies and room >= 9 and limited_ammo_low and coins < 5:
+        if room >= 9 and room not in self.ammo_shop_rooms and coins < 5:
             return 5 - coins
         if speed < 2 and coins < 10:
             return 10 - coins
         if fire_rate < 3 and coins < 15:
             return 15 - coins
-        if speed < 4 and coins < 10:
+        if speed < 3 and coins < 10:
             return 10 - coins
         if fire_rate < 5 and coins < 15:
             return 15 - coins
+        if speed < 4 and coins < 10:
+            return 10 - coins
         if self._next_damage_stack_useful(damage) and coins < 20:
             return 20 - coins
         if no_enemies and limited_ammo_low and coins < 5:
             return 5 - coins
         return 0
+
+    def _limited_ammo_low_for_final(self, ammo: int, current_weapon: int) -> bool:
+        if current_weapon in (WEAPON_RIFLE, WEAPON_SHOTGUN) and ammo <= LOW_AMMO_THRESHOLD:
+            return True
+        return bool(self.teacher.empty_weapons.intersection({WEAPON_RIFLE, WEAPON_SHOTGUN}))
 
     def _next_damage_stack_useful(self, damage_stacks: int) -> bool:
         next_stack = damage_stacks + 1
@@ -1003,7 +1093,10 @@ class LiveBot:
             "distance_to_spawn_base": target_spawn.get("distance_to_spawn_base"),
             "river_door_shortcut_used": self.teacher.route_mode == "river_door",
             "solid_blocked_cat_exists": solid_blocked_exists,
-            "room10_survival_mode": self.world.current_room == 10 and self.teacher.route_mode == "spawn_immediate_threat",
+            "room10_survival_mode": self.world.current_room == 10 and not self.teacher.only_big_cats_remain(self.world),
+            "room10_last_heavy_dps_mode": (
+                self.world.current_room == 10 and self.teacher.only_big_cats_remain(self.world)
+            ),
             "pre_door_health_active": self._should_collect_pre_door_health(hp),
         }
 

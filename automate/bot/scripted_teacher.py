@@ -25,6 +25,10 @@ MAX_SHOOT_DISTANCE = 420.0
 PROJECTILE_SPEED = 600.0
 SHOTGUN_EFFECTIVE_RANGE = 210.0
 LONG_WEAPON_EFFECTIVE_RANGE = 900.0
+ROOM10_SHOTGUN_MIN = 150.0
+ROOM10_SHOTGUN_MAX = 205.0
+ROOM10_RIFLE_MIN = 240.0
+ROOM10_RIFLE_MAX = 420.0
 TARGET_SWITCH_ADVANTAGE = 64.0
 DOOR_TARGET_SWITCH_ADVANTAGE = 96.0
 RIVER_DOOR_CLOSE_DISTANCE = 520.0
@@ -303,6 +307,12 @@ class ScriptedTeacher:
         py: float,
         enemies: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        visible_enemies = [
+            enemy
+            for enemy in enemies
+            if room.line_of_fire_clear(px, py, float(enemy["x"]), float(enemy["y"]))
+        ]
+        room_id = int(world.current_room or 1)
         if plan.immediate_threat_spawn_groups:
             immediate = [
                 enemy
@@ -310,6 +320,17 @@ class ScriptedTeacher:
                 if spawn_group(world.current_room, enemy) in plan.immediate_threat_spawn_groups
             ]
             if immediate:
+                visible_immediate = [
+                    enemy
+                    for enemy in immediate
+                    if room.line_of_fire_clear(px, py, float(enemy["x"]), float(enemy["y"]))
+                ]
+                if visible_immediate:
+                    self.route_mode = "spawn_visible_immediate_threat"
+                    return visible_immediate
+                if visible_enemies:
+                    self.route_mode = "visible_sweep"
+                    return visible_enemies
                 non_boss = [
                     enemy
                     for enemy in immediate
@@ -329,10 +350,14 @@ class ScriptedTeacher:
                 for enemy in obstacle_group
                 if not room.line_of_fire_clear(px, py, float(enemy["x"]), float(enemy["y"]))
             ]
-            if blocked_obstacle_group:
+            if blocked_obstacle_group and (room_id == 5 or not visible_enemies):
                 self.route_mode = "spawn_obstacle_first"
                 return blocked_obstacle_group
-            if obstacle_group and not self.should_use_river_door_shortcut(world, px, py):
+            if (
+                obstacle_group
+                and (room_id == 5 or not visible_enemies)
+                and not self.should_use_river_door_shortcut(world, px, py)
+            ):
                 self.route_mode = "spawn_obstacle_group"
                 return obstacle_group
 
@@ -347,9 +372,13 @@ class ScriptedTeacher:
                 for enemy in flank_group
                 if not room.line_of_fire_clear(px, py, float(enemy["x"]), float(enemy["y"]))
             ]
-            if blocked_flank_group:
+            if blocked_flank_group and not visible_enemies:
                 self.route_mode = "spawn_flank_required"
                 return blocked_flank_group
+
+        if visible_enemies:
+            self.route_mode = "visible_sweep"
+            return visible_enemies
 
         if plan.obstacle_targets_first:
             blocked = [
@@ -357,7 +386,7 @@ class ScriptedTeacher:
                 for enemy in enemies
                 if not room.line_of_fire_clear(px, py, float(enemy["x"]), float(enemy["y"]))
             ]
-            if blocked:
+            if blocked and not visible_enemies:
                 self.route_mode = "obstacle_first"
                 return blocked
         return enemies
@@ -491,13 +520,45 @@ class ScriptedTeacher:
         hp = int(target.get("hp", 1))
         enemy_type = int(target.get("type", 1) or 1)
 
-        # State packets only expose ammo for the current weapon. Use conservative
-        # switching unless the current weapon is known to be loaded.
+        room_id = int(world.current_room or 1)
+
+        # State packets only expose ammo for the current weapon. Treat weapons as
+        # usable until a current-weapon state proves they are empty.
+        if room_id == 10 and enemy_type in BIG_CAT_TYPES:
+            if dist <= SHOTGUN_EFFECTIVE_RANGE:
+                if current == WEAPON_SHOTGUN and ammo > 0:
+                    return WEAPON_SHOTGUN
+                if current != WEAPON_SHOTGUN and WEAPON_SHOTGUN not in self.empty_weapons:
+                    return WEAPON_SHOTGUN
+            if dist <= LONG_WEAPON_EFFECTIVE_RANGE:
+                if current == WEAPON_RIFLE and ammo > 0:
+                    return WEAPON_RIFLE
+                if current != WEAPON_RIFLE and WEAPON_RIFLE not in self.empty_weapons:
+                    return WEAPON_RIFLE
+
+        if room_id == 10 and enemy_type in SMALL_CAT_TYPES:
+            # Keep limited ammo for room-10 tanks/boss unless a fast threat is
+            # close enough that survival matters more than conserving ammo.
+            if dist < MIN_SHOOT_DISTANCE or cluster >= 3:
+                if current == WEAPON_RIFLE and ammo > 0:
+                    return WEAPON_RIFLE
+                if current != WEAPON_RIFLE and WEAPON_RIFLE not in self.empty_weapons:
+                    return WEAPON_RIFLE
+
         if enemy_type in BIG_CAT_TYPES and dist <= SHOTGUN_EFFECTIVE_RANGE:
             if current == WEAPON_SHOTGUN and ammo > 0:
                 return WEAPON_SHOTGUN
             if current != WEAPON_SHOTGUN and WEAPON_SHOTGUN not in self.empty_weapons:
                 return WEAPON_SHOTGUN
+        if (
+            room_id >= 5
+            and dist <= LONG_WEAPON_EFFECTIVE_RANGE
+            and (hp >= 3 or cluster >= 2 or enemy_type in FAST_CAT_TYPES)
+        ):
+            if current == WEAPON_RIFLE and ammo > 0:
+                return WEAPON_RIFLE
+            if current != WEAPON_RIFLE and WEAPON_RIFLE not in self.empty_weapons:
+                return WEAPON_RIFLE
         if current == WEAPON_SHOTGUN and ammo > 0 and dist <= SHOTGUN_EFFECTIVE_RANGE and (cluster >= 2 or hp >= 8):
             return WEAPON_SHOTGUN
         if current == WEAPON_RIFLE and ammo > 0:
@@ -534,19 +595,30 @@ class ScriptedTeacher:
         tx = float(target["x"]) - px
         ty = float(target["y"]) - py
         tdist = max(1.0, math.hypot(tx, ty))
+        nearest_enemy = min(
+            world.enemies.values(),
+            key=lambda enemy: distance(px, py, float(enemy["x"]), float(enemy["y"])),
+        )
+        nearest_enemy_dist = distance(
+            px,
+            py,
+            float(nearest_enemy["x"]),
+            float(nearest_enemy["y"]),
+        )
+        if nearest_enemy_dist <= EMERGENCY_SHOOT_DISTANCE * 0.75:
+            breakthrough = self.break_out_if_trapped(world, px, py)
+            if breakthrough is not None:
+                return breakthrough
+            return self.escape_close_threats(world, px, py, nearest_enemy)
+        if self.room10_last_heavy_active(world, target):
+            return self.room10_last_heavy_movement(world, px, py, target, range_ok)
+
         if self.river_door_opportunity(world, px, py, target) and self.should_use_river_door_shortcut(world, px, py):
             routed = self.route_to_door(world, px, py)
             if routed is not None:
                 self.current_goal_cell = None
                 return self.avoid_trap_move(world, px, py, routed[0], routed[1])
 
-        nearest_enemy_dist = min(
-            (
-                distance(px, py, float(enemy["x"]), float(enemy["y"]))
-                for enemy in world.enemies.values()
-            ),
-            default=999.0,
-        )
         if IDEAL_FIRE_MIN <= tdist <= IDEAL_FIRE_MAX and nearest_enemy_dist >= MIN_SHOOT_DISTANCE:
             plan = get_room_plan(world.current_room)
             self.current_goal_cell = None
@@ -614,6 +686,55 @@ class ScriptedTeacher:
             return 0.0, 0.0
         return self.avoid_trap_move(world, px, py, vx / mag, vy / mag)
 
+    def only_big_cats_remain(self, world: WorldModel) -> bool:
+        return bool(world.enemies) and all(
+            int(enemy.get("type", 1) or 1) in BIG_CAT_TYPES
+            for enemy in world.enemies.values()
+        )
+
+    def room10_last_heavy_active(self, world: WorldModel, target: dict[str, Any]) -> bool:
+        return (
+            int(world.current_room or 0) == 10
+            and self.only_big_cats_remain(world)
+            and int(target.get("type", 1) or 1) in BIG_CAT_TYPES
+        )
+
+    def room10_last_heavy_movement(
+        self,
+        world: WorldModel,
+        px: float,
+        py: float,
+        target: dict[str, Any],
+        range_ok: bool,
+    ) -> tuple[float, float]:
+        tx = float(target["x"]) - px
+        ty = float(target["y"]) - py
+        tdist = max(1.0, math.hypot(tx, ty))
+        current = int(world.player.get("weapon_id", WEAPON_PISTOL))
+        ammo = int(world.player.get("ammo", 0))
+
+        if current == WEAPON_SHOTGUN and ammo > 0:
+            preferred_min = ROOM10_SHOTGUN_MIN
+            preferred_max = ROOM10_SHOTGUN_MAX
+        elif current == WEAPON_RIFLE and ammo > 0:
+            preferred_min = ROOM10_RIFLE_MIN
+            preferred_max = ROOM10_RIFLE_MAX
+        else:
+            preferred_min = IDEAL_FIRE_MIN
+            preferred_max = IDEAL_FIRE_MAX
+
+        if tdist > preferred_max:
+            self.current_goal_cell = None
+            return self.avoid_trap_move(world, px, py, tx / tdist, ty / tdist)
+        if tdist < preferred_min:
+            self.current_goal_cell = None
+            return self.avoid_trap_move(world, px, py, -tx / tdist, -ty / tdist)
+
+        # Hold LOS and DPS pressure; use light strafe instead of the full room-10
+        # survival loop once only a heavy remains.
+        strafe = normalize_pair(-ty / tdist, tx / tdist)
+        return self.avoid_trap_move(world, px, py, strafe[0], strafe[1])
+
     def combat_door_bias(self, world: WorldModel, px: float, py: float) -> tuple[float, float] | None:
         plan = get_room_plan(world.current_room)
         if plan.combat_door_bias_enemy_count is None or plan.combat_door_bias_weight <= 0.0:
@@ -652,6 +773,14 @@ class ScriptedTeacher:
         else:
             self.blocked_target_id = target_id
             self.blocked_target_ticks = 1
+
+        tdist = distance(px, py, tx, ty)
+        if self.blocked_target_ticks >= 8 and tdist <= IDEAL_FIRE_MIN:
+            routed = self.run_past_blocked_target(world, room, px, py, tx, ty)
+            if routed is not None:
+                self.current_goal_cell = None
+                self.goal_reason = "run_past_blocked_target"
+                return routed
 
         routed = self.route_to_line_of_fire_position(world, room, px, py, tx, ty)
         if routed is not None:
@@ -740,6 +869,38 @@ class ScriptedTeacher:
                 best = (dx, dy)
 
         return self.avoid_trap_move(world, px, py, best[0], best[1])
+
+    def run_past_blocked_target(
+        self,
+        world: WorldModel,
+        room: Any,
+        px: float,
+        py: float,
+        tx: float,
+        ty: float,
+    ) -> tuple[float, float] | None:
+        door = self.known_door_point(world)
+        if door is not None:
+            routed = room.direction_to_reachable_near_point(px, py, door[0], door[1], 48.0)
+            if routed is not None:
+                return normalize_pair(*routed)
+
+        vx = tx - px
+        vy = ty - py
+        mag = math.hypot(vx, vy)
+        if mag < 1e-6:
+            return None
+        ux = vx / mag
+        uy = vy / mag
+        for gx, gy, radius in (
+            (tx + ux * 220.0, ty + uy * 220.0, 32.0),
+            (tx + ux * 120.0, ty + uy * 120.0, 32.0),
+            (tx, ty, 32.0),
+        ):
+            routed = room.direction_to_reachable_near_point(px, py, gx, gy, radius)
+            if routed is not None:
+                return normalize_pair(*routed)
+        return None
 
     def avoid_trap_move(
         self, world: WorldModel, px: float, py: float, dx: float, dy: float
