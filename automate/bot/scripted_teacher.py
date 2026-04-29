@@ -12,8 +12,12 @@ from .world_model import WorldModel
 WEAPON_PISTOL = 1
 WEAPON_RIFLE = 2
 WEAPON_SHOTGUN = 3
-PREFERRED_FIRE_DISTANCE = 160.0
-MIN_SAFE_DISTANCE = 115.0
+TILE_SIZE = 32.0
+MIN_SHOOT_DISTANCE = TILE_SIZE * 5.0
+PREFERRED_FIRE_DISTANCE = 190.0
+PROJECTILE_SPEED = 600.0
+SHOTGUN_EFFECTIVE_RANGE = 210.0
+LONG_WEAPON_EFFECTIVE_RANGE = 900.0
 
 ENEMY_THREAT = {
     1: 1.0,  # grunt
@@ -47,6 +51,8 @@ class Action:
     weapon_id: int | None = None
     target_id: int | None = None
     los_clear: bool = False
+    range_ok: bool = False
+    distance_to_target: float = 0.0
     reason: str = ""
 
 
@@ -67,18 +73,31 @@ class ScriptedTeacher:
         if target is None:
             return Action()
 
+        target_dist = distance(px, py, float(target["x"]), float(target["y"]))
         weapon = self.choose_weapon(world, target, px, py) if los_clear else None
-        aim = math.atan2(float(target["y"]) - py, float(target["x"]) - px)
-        dx, dy = self.choose_movement(world, px, py, target, los_clear)
+        max_range = weapon_effective_range(weapon)
+        range_ok = MIN_SHOOT_DISTANCE <= target_dist <= max_range
+        aim = self.predictive_aim(world, px, py, target)
+        dx, dy = self.choose_movement(world, px, py, target, los_clear, range_ok)
+        if not los_clear:
+            reason = "reposition_for_los"
+        elif target_dist < MIN_SHOOT_DISTANCE:
+            reason = "back_up_to_5_steps"
+        elif target_dist > max_range:
+            reason = "close_distance"
+        else:
+            reason = "visible_target"
         return Action(
             dx=dx,
             dy=dy,
             aim_angle=aim,
-            fire=los_clear,
+            fire=los_clear and range_ok,
             weapon_id=weapon,
             target_id=int(target["entity_id"]),
             los_clear=los_clear,
-            reason="visible_target" if los_clear else "reposition_for_los",
+            range_ok=range_ok,
+            distance_to_target=target_dist,
+            reason=reason,
         )
 
     def choose_target(
@@ -122,19 +141,31 @@ class ScriptedTeacher:
 
         # State packets only expose ammo for the current weapon. Use conservative
         # switching unless the current weapon is known to be loaded.
-        if current == WEAPON_SHOTGUN and ammo > 0 and dist < 280 and (cluster >= 2 or hp >= 8):
+        if current == WEAPON_SHOTGUN and ammo > 0 and dist <= SHOTGUN_EFFECTIVE_RANGE and (cluster >= 2 or hp >= 8):
             return WEAPON_SHOTGUN
         if current == WEAPON_RIFLE and ammo > 0:
             return WEAPON_RIFLE
-        if dist < 220 and (cluster >= 3 or hp >= 10):
+        if dist <= SHOTGUN_EFFECTIVE_RANGE and (cluster >= 3 or hp >= 10):
             return WEAPON_SHOTGUN
         return WEAPON_PISTOL
 
     def choose_movement(
-        self, world: WorldModel, px: float, py: float, target: dict[str, Any], los_clear: bool
+        self,
+        world: WorldModel,
+        px: float,
+        py: float,
+        target: dict[str, Any],
+        los_clear: bool,
+        range_ok: bool,
     ) -> tuple[float, float]:
         if not los_clear:
             return self.reposition_for_los(world, px, py, target)
+
+        tx = float(target["x"]) - px
+        ty = float(target["y"]) - py
+        tdist = max(1.0, math.hypot(tx, ty))
+        if tdist < MIN_SHOOT_DISTANCE:
+            return -tx / tdist, -ty / tdist
 
         vx = 0.0
         vy = 0.0
@@ -149,16 +180,13 @@ class ScriptedTeacher:
                 vx += dx / dist * weight
                 vy += dy / dist * weight
 
-        # Keep pressure on the target without walking into melee range.
-        tx = float(target["x"]) - px
-        ty = float(target["y"]) - py
-        tdist = max(1.0, math.hypot(tx, ty))
+        # Keep pressure on the target without breaking the five-step spacing.
         if tdist > PREFERRED_FIRE_DISTANCE + 35.0:
             vx += tx / tdist * 0.7
             vy += ty / tdist * 0.7
-        elif tdist < MIN_SAFE_DISTANCE:
-            vx -= tx / tdist * 0.8
-            vy -= ty / tdist * 0.8
+        elif not range_ok:
+            vx += tx / tdist * 0.7
+            vy += ty / tdist * 0.7
 
         mag = math.hypot(vx, vy)
         if mag < 1e-6:
@@ -221,6 +249,20 @@ class ScriptedTeacher:
 
         return best
 
+    def predictive_aim(
+        self, world: WorldModel, px: float, py: float, target: dict[str, Any]
+    ) -> float:
+        entity_id = int(target.get("entity_id", 0) or 0)
+        tx = float(target["x"])
+        ty = float(target["y"])
+        dist = distance(px, py, tx, ty)
+        velocity = world.enemy_velocities.get(entity_id)
+        if velocity is not None:
+            travel_time = min(1.5, dist / PROJECTILE_SPEED)
+            tx += velocity[0] * travel_time
+            ty += velocity[1] * travel_time
+        return math.atan2(ty - py, tx - px)
+
     def cluster_score(self, world: WorldModel, x: float, y: float) -> int:
         score = 0
         for enemy in world.enemies.values():
@@ -231,3 +273,9 @@ class ScriptedTeacher:
 
 def distance(ax: float, ay: float, bx: float, by: float) -> float:
     return math.hypot(bx - ax, by - ay)
+
+
+def weapon_effective_range(weapon_id: int | None) -> float:
+    if weapon_id == WEAPON_SHOTGUN:
+        return SHOTGUN_EFFECTIVE_RANGE
+    return LONG_WEAPON_EFFECTIVE_RANGE

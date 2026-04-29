@@ -18,8 +18,8 @@ Files:
 - `AUDIT_AND_DESIGN.md`: full audit, optimization report, bot architecture, training plan, reward plan, and checklist.
 - `bot/protocol.py`: packet constants and envelope helpers.
 - `bot/world_model.py`: structured game-state cache.
-- `bot/scripted_teacher.py`: deterministic combat policy starter.
-- `bot/run_live.py`: live websocket bot loop scaffold.
+- `bot/scripted_teacher.py`: deterministic combat policy with room geometry, line-of-fire checks, five-tile firing distance, and lead aiming.
+- `bot/run_live.py`: live websocket bot loop with pickup claiming, shop automation, visible door walking, and JSONL recording.
 - `bot/seed_search.py`: seed ranking scaffold for legal start-time windows.
 - `training/policy_model.py`: compact PyTorch policy outline.
 - `training/train_bc.py`: behavior cloning outline.
@@ -33,6 +33,9 @@ python3 -m venv automate/.venv
 automate/.venv/bin/python -m pip install websocket-client
 automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/ws --player-id bot-local --verbose
 automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/ws --player-id bot-local --verbose --stop-room 2
+automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/ws --player-id bot-local --verbose --stop-room 4 --pickup-mode on-way
 ```
+
+Door walking is now the default so the browser view shows the bot physically moving to the unlocked door. Use `--no-walk-to-door` to test the faster protocol shortcut. Pickup mode defaults to `remote`; `--pickup-mode on-way` limits coin pickup claims to nearby/path pickups while still prioritizing low-health and low-ammo recovery.
 
 For fastest offline iteration, put the eventual Go headless runner under `server/internal/...` because Go's `internal` import rule prevents code in this repo-root `automate` folder from importing `server/internal/game` directly.

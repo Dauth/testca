@@ -15,6 +15,12 @@ from .seed_search import choose_seed
 from .world_model import WorldModel
 
 
+LOW_HEALTH_THRESHOLD = 45
+LOW_AMMO_THRESHOLD = 3
+COIN_NEAR_DISTANCE = 140.0
+COIN_PATH_DISTANCE = 96.0
+
+
 class LiveBot:
     def __init__(
         self,
@@ -22,8 +28,9 @@ class LiveBot:
         player_id: str,
         log_dir: str = "automate/runs",
         stop_room: int = 0,
-        walk_to_door: bool = False,
+        walk_to_door: bool = True,
         door_enter_distance: float = 58.0,
+        pickup_mode: str = "remote",
     ):
         self.url = url
         self.player_id = player_id
@@ -41,6 +48,7 @@ class LiveBot:
         self.stop_room = stop_room
         self.walk_to_door = walk_to_door
         self.door_enter_distance = door_enter_distance
+        self.pickup_mode = pickup_mode
         self.stop_requested = False
         self.record_path = self._make_record_path(log_dir)
         self.record_file = self.record_path.open("a", encoding="utf-8")
@@ -74,6 +82,8 @@ class LiveBot:
 
             while not self.world.run_complete and not self.stop_requested:
                 self._drain_available(ws)
+                if self.stop_requested:
+                    break
                 packets = list(self._decide_messages())
                 for msg in packets:
                     ws.send(msg)
@@ -136,9 +146,6 @@ class LiveBot:
 
     def _decide_messages(self) -> Iterable[str]:
         self.last_action_summary = {}
-        # Remote pickup conversion: claim as coins by default. If health is low,
-        # convert the next pickup to health. Ammo refills should switch weapon
-        # first, then claim as ammo.
         hp = int(self.world.player.get("hp", 100) or 100)
         ammo = int(self.world.player.get("ammo", 9999) or 9999)
         current_weapon = int(self.world.player.get("weapon_id", 1) or 1)
@@ -146,21 +153,28 @@ class LiveBot:
         for pickup_id in self.world.visible_pickup_ids():
             if pickup_id in self.claimed_pickups:
                 continue
+            pickup_type, pickup_reason = self._pickup_claim(pickup_id, hp, ammo, current_weapon)
+            if pickup_type is None:
+                continue
             self.claimed_pickups.add(pickup_id)
-            if hp <= 45:
-                self.logger.info("pickup seen id=%s claim=health hp=%s", pickup_id, hp)
-                yield self.proto.interact(pickup_id, protocol.PICKUP_HEALTH)
-            elif current_weapon in (2, 3) and ammo <= 3:
+            if pickup_type == protocol.PICKUP_HEALTH:
                 self.logger.info(
-                    "pickup seen id=%s claim=ammo weapon=%s ammo=%s",
+                    "pickup seen id=%s claim=health reason=%s hp=%s",
                     pickup_id,
+                    pickup_reason,
+                    hp,
+                )
+            elif pickup_type == protocol.PICKUP_AMMO:
+                self.logger.info(
+                    "pickup seen id=%s claim=ammo reason=%s weapon=%s ammo=%s",
+                    pickup_id,
+                    pickup_reason,
                     current_weapon,
                     ammo,
                 )
-                yield self.proto.interact(pickup_id, protocol.PICKUP_AMMO)
             else:
-                self.logger.info("pickup seen id=%s claim=coin", pickup_id)
-                yield self.proto.interact(pickup_id, protocol.PICKUP_COIN)
+                self.logger.info("pickup seen id=%s claim=coin reason=%s", pickup_id, pickup_reason)
+            yield self.proto.interact(pickup_id, pickup_type)
 
         # Direct shop purchases. Spend toward combat speed first; ammo only when
         # the active limited-ammo weapon is low.
@@ -185,6 +199,8 @@ class LiveBot:
                 self.last_action_summary = {
                     "target_id": door_id,
                     "los_clear": True,
+                    "range_ok": False,
+                    "distance_to_target": self._door_distance(door_id),
                     "reason": "move_to_door",
                     "dx": dx,
                     "dy": dy,
@@ -208,6 +224,8 @@ class LiveBot:
         self.last_action_summary = {
             "target_id": action.target_id,
             "los_clear": action.los_clear,
+            "range_ok": action.range_ok,
+            "distance_to_target": action.distance_to_target,
             "reason": action.reason,
             "dx": action.dx,
             "dy": action.dy,
@@ -221,12 +239,14 @@ class LiveBot:
             now = time.time()
             if now - self.last_shot_at >= 0.2:
                 self.logger.info(
-                    "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s los_clear=%s reason=%s",
+                    "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s distance=%.1f los_clear=%s range_ok=%s reason=%s",
                     action.target_id,
                     action.weapon_id or current_weapon,
                     action.aim_angle,
                     len(self.world.enemies),
+                    action.distance_to_target,
                     action.los_clear,
+                    action.range_ok,
                     action.reason,
                 )
                 self.last_shot_at = now
@@ -237,13 +257,15 @@ class LiveBot:
             now = time.time()
             if now - self.last_los_log_at >= 0.5:
                 self.logger.info(
-                    "shot held target_id=%s los_clear=%s reason=%s room=%s",
+                    "shot held target_id=%s distance=%.1f los_clear=%s range_ok=%s reason=%s room=%s",
                     action.target_id,
+                    action.distance_to_target,
                     action.los_clear,
+                    action.range_ok,
                     action.reason,
                     self.world.current_room,
                 )
-                if action.reason:
+                if action.reason == "reposition_for_los":
                     self.logger.info(
                         "target blocked target_id=%s reason=%s room=%s",
                         action.target_id,
@@ -335,14 +357,65 @@ class LiveBot:
     def _summarize_packets(self, packets: list[str]) -> list[str]:
         return [protocol.packet_name(json.loads(packet).get("type")) for packet in packets]
 
+    def _pickup_claim(
+        self, pickup_id: int, hp: int, ammo: int, current_weapon: int
+    ) -> tuple[int | None, str]:
+        if hp <= LOW_HEALTH_THRESHOLD:
+            return protocol.PICKUP_HEALTH, "low_hp"
+        if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
+            return protocol.PICKUP_AMMO, "low_ammo"
+        if self.pickup_mode == "on-way" and not self._pickup_on_way(pickup_id):
+            return None, "coin_off_path"
+        if self.pickup_mode == "on-way":
+            return protocol.PICKUP_COIN, "coin_on_way"
+        return protocol.PICKUP_COIN, "coin_default"
+
+    def _pickup_on_way(self, pickup_id: int) -> bool:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        x = float(pickup.get("x", px) or px)
+        y = float(pickup.get("y", py) or py)
+        if math.hypot(x - px, y - py) <= COIN_NEAR_DISTANCE:
+            return True
+
+        objective = self._current_objective_point()
+        if objective is None:
+            return False
+        return distance_to_segment(x, y, px, py, objective[0], objective[1]) <= COIN_PATH_DISTANCE
+
+    def _current_objective_point(self) -> tuple[float, float] | None:
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        if self.world.enemies:
+            target = min(
+                self.world.enemies.values(),
+                key=lambda e: math.hypot(
+                    float(e.get("x", px) or px) - px,
+                    float(e.get("y", py) or py) - py,
+                ),
+            )
+            return float(target.get("x", px) or px), float(target.get("y", py) or py)
+
+        door_id = self.world.best_unlocked_door()
+        if door_id is None:
+            return None
+        door = self.world.doors.get(int(door_id)) or {}
+        return float(door.get("x", px) or px), float(door.get("y", py) or py)
+
     def _near_door(self, door_id: int) -> bool:
+        return self._door_distance(door_id) <= self.door_enter_distance
+
+    def _door_distance(self, door_id: int) -> float:
         door = self.world.doors.get(int(door_id)) or {}
         player = self.world.player or {}
         px = float(player.get("x", 0.0) or 0.0)
         py = float(player.get("y", 0.0) or 0.0)
         dx = float(door.get("x", px) or px) - px
         dy = float(door.get("y", py) or py) - py
-        return math.hypot(dx, dy) <= self.door_enter_distance
+        return math.hypot(dx, dy)
 
     def _door_direction(self, door_id: int) -> tuple[float, float]:
         door = self.world.doors.get(int(door_id)) or {}
@@ -353,6 +426,8 @@ class LiveBot:
         ty = float(door.get("y", py) or py)
         try:
             room = self.geometry.load_room(int(self.world.current_room or 1))
+            if walk_path_clear(room, px, py, tx, ty):
+                return normalize(tx - px, ty - py)
             routed = room.direction_to_reachable_near_point(
                 px,
                 py,
@@ -382,6 +457,32 @@ def normalize(dx: float, dy: float) -> tuple[float, float]:
     return dx / mag, dy / mag
 
 
+def distance_to_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    vx = bx - ax
+    vy = by - ay
+    wx = px - ax
+    wy = py - ay
+    denom = vx * vx + vy * vy
+    if denom <= 1e-6:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / denom))
+    cx = ax + t * vx
+    cy = ay + t * vy
+    return math.hypot(px - cx, py - cy)
+
+
+def walk_path_clear(room, ax: float, ay: float, bx: float, by: float) -> bool:
+    dist = math.hypot(bx - ax, by - ay)
+    steps = max(1, int(dist / 12.0))
+    for i in range(1, steps + 1):
+        t = i / steps
+        x = ax + (bx - ax) * t
+        y = ay + (by - ay) * t
+        if room.blocked_aabb(x, y):
+            return False
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8080/ws")
@@ -389,8 +490,9 @@ def main() -> None:
     parser.add_argument("--log-dir", default="automate/runs")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-room", type=int, default=0)
-    parser.add_argument("--walk-to-door", action="store_true")
+    parser.add_argument("--no-walk-to-door", action="store_true")
     parser.add_argument("--door-enter-distance", type=float, default=58.0)
+    parser.add_argument("--pickup-mode", choices=("remote", "on-way"), default="remote")
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -401,8 +503,9 @@ def main() -> None:
         args.player_id,
         args.log_dir,
         args.stop_room,
-        args.walk_to_door,
+        not args.no_walk_to_door,
         args.door_enter_distance,
+        args.pickup_mode,
     ).run()
 
 

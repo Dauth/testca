@@ -14,6 +14,8 @@ class WorldModel:
     tilemap_id: str | None = None
     player: dict[str, Any] = field(default_factory=dict)
     enemies: dict[int, dict[str, Any]] = field(default_factory=dict)
+    previous_enemies: dict[int, dict[str, Any]] = field(default_factory=dict)
+    enemy_velocities: dict[int, tuple[float, float]] = field(default_factory=dict)
     pickups: dict[int, dict[str, Any]] = field(default_factory=dict)
     projectiles: dict[int, dict[str, Any]] = field(default_factory=dict)
     doors: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -25,6 +27,7 @@ class WorldModel:
     outcome: str | None = None
     total_ms: int | None = None
     latest_server_ts: int | None = None
+    last_state_elapsed_ms: int | None = None
     last_error: str | None = None
 
     def apply(self, env: dict[str, Any]) -> None:
@@ -42,14 +45,31 @@ class WorldModel:
             self.outcome = None
             self.total_ms = None
             self.splits = []
+            self.last_state_elapsed_ms = None
         elif typ == protocol.S2C_STATE:
-            self.elapsed_ms = int(data.get("elapsed_ms") or 0)
+            new_elapsed_ms = int(data.get("elapsed_ms") or 0)
+            dt = 0.05
+            if self.last_state_elapsed_ms is not None and new_elapsed_ms > self.last_state_elapsed_ms:
+                dt = max(0.001, (new_elapsed_ms - self.last_state_elapsed_ms) / 1000.0)
+            self.elapsed_ms = new_elapsed_ms
+            self.last_state_elapsed_ms = new_elapsed_ms
             self.player = data.get("player") or {}
-            self.enemies = {
+            self.previous_enemies = self.enemies
+            new_enemies = {
                 int(e["entity_id"]): e
                 for e in data.get("entities", [])
                 if int(e.get("entity_id", 0)) not in self.dead_entities
             }
+            velocities: dict[int, tuple[float, float]] = {}
+            for entity_id, enemy in new_enemies.items():
+                previous = self.previous_enemies.get(entity_id)
+                if previous is None:
+                    continue
+                vx = (float(enemy.get("x", 0.0) or 0.0) - float(previous.get("x", 0.0) or 0.0)) / dt
+                vy = (float(enemy.get("y", 0.0) or 0.0) - float(previous.get("y", 0.0) or 0.0)) / dt
+                velocities[entity_id] = (vx, vy)
+            self.enemies = new_enemies
+            self.enemy_velocities = velocities
             self.pickups = {
                 int(p["entity_id"]): p
                 for p in data.get("pickups", [])
@@ -87,7 +107,9 @@ class WorldModel:
         self.room_data = room
         self.tilemap_id = room.get("tilemap_id")
         self.current_room = room.get("room_index")
+        self.previous_enemies = self.enemies
         self.enemies = {int(e["entity_id"]): e for e in room.get("enemies", [])}
+        self.enemy_velocities = {}
         self.pickups = {int(p["entity_id"]): p for p in room.get("pickups", [])}
         self.projectiles = {}
         self.doors = {int(d["door_id"]): d for d in room.get("doors", [])}
