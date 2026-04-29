@@ -19,6 +19,7 @@ LOW_HEALTH_THRESHOLD = 45
 LOW_AMMO_THRESHOLD = 3
 COIN_NEAR_DISTANCE = 140.0
 COIN_PATH_DISTANCE = 96.0
+PICKUP_INTERACT_DISTANCE = 48.0
 
 
 class LiveBot:
@@ -30,7 +31,8 @@ class LiveBot:
         stop_room: int = 0,
         walk_to_door: bool = True,
         door_enter_distance: float = 58.0,
-        pickup_mode: str = "remote",
+        pickup_mode: str = "physical",
+        pickup_interact_distance: float = PICKUP_INTERACT_DISTANCE,
     ):
         self.url = url
         self.player_id = player_id
@@ -49,6 +51,7 @@ class LiveBot:
         self.walk_to_door = walk_to_door
         self.door_enter_distance = door_enter_distance
         self.pickup_mode = pickup_mode
+        self.pickup_interact_distance = pickup_interact_distance
         self.stop_requested = False
         self.record_path = self._make_record_path(log_dir)
         self.record_file = self.record_path.open("a", encoding="utf-8")
@@ -82,7 +85,7 @@ class LiveBot:
 
             while not self.world.run_complete and not self.stop_requested:
                 self._drain_available(ws)
-                if self.stop_requested:
+                if self.world.run_complete or self.stop_requested:
                     break
                 packets = list(self._decide_messages())
                 for msg in packets:
@@ -150,6 +153,34 @@ class LiveBot:
         ammo = int(self.world.player.get("ammo", 9999) or 9999)
         current_weapon = int(self.world.player.get("weapon_id", 1) or 1)
 
+        priority_pickup = self._priority_pickup_target(hp, ammo, current_weapon)
+        if priority_pickup is not None and not self._near_pickup(priority_pickup):
+            dx, dy = self._pickup_direction(priority_pickup)
+            pickup = self.world.pickups.get(priority_pickup) or {}
+            self.last_action_summary = {
+                "objective_type": "pickup",
+                "objective_id": priority_pickup,
+                "pickup_id": priority_pickup,
+                "pickup_type": pickup.get("type"),
+                "pickup_reason": "low_hp" if hp <= LOW_HEALTH_THRESHOLD else "low_ammo",
+                "physical_interact_allowed": False,
+                "dx": dx,
+                "dy": dy,
+                "fire": False,
+                "reason": "move_to_priority_pickup",
+            }
+            self.logger.info(
+                "move_to_pickup id=%s type=%s reason=%s distance=%.1f dx=%.3f dy=%.3f",
+                priority_pickup,
+                pickup.get("type"),
+                self.last_action_summary["pickup_reason"],
+                self._pickup_distance(priority_pickup),
+                dx,
+                dy,
+            )
+            yield self.proto.input(dx, dy)
+            return
+
         for pickup_id in self.world.visible_pickup_ids():
             if pickup_id in self.claimed_pickups:
                 continue
@@ -174,6 +205,16 @@ class LiveBot:
                 )
             else:
                 self.logger.info("pickup seen id=%s claim=coin reason=%s", pickup_id, pickup_reason)
+            self.last_action_summary = {
+                "objective_type": "pickup",
+                "objective_id": pickup_id,
+                "pickup_id": pickup_id,
+                "pickup_type": pickup_type,
+                "pickup_reason": pickup_reason,
+                "physical_interact_allowed": self._near_pickup(pickup_id) or self.pickup_mode == "remote",
+                "distance_to_pickup": self._pickup_distance(pickup_id),
+                "reason": "interact_pickup",
+            }
             yield self.proto.interact(pickup_id, pickup_type)
 
         # Direct shop purchases. Spend toward combat speed first; ammo only when
@@ -197,6 +238,8 @@ class LiveBot:
             if self.walk_to_door and not self._near_door(door_id):
                 dx, dy = self._door_direction(door_id)
                 self.last_action_summary = {
+                    "objective_type": "door",
+                    "objective_id": door_id,
                     "target_id": door_id,
                     "los_clear": True,
                     "range_ok": False,
@@ -206,6 +249,9 @@ class LiveBot:
                     "dy": dy,
                     "fire": False,
                     "weapon_id": None,
+                    "door_id": door_id,
+                    "distance_to_door": self._door_distance(door_id),
+                    "physical_interact_allowed": False,
                 }
                 self.logger.info(
                     "move_to_door door_id=%s room=%s dx=%.3f dy=%.3f",
@@ -216,12 +262,19 @@ class LiveBot:
                 )
                 yield self.proto.input(dx, dy)
                 return
-            self.logger.info("enter_door sent door_id=%s room=%s", door_id, self.world.current_room)
+            self.logger.info(
+                "enter_door sent door_id=%s room=%s distance=%.1f",
+                door_id,
+                self.world.current_room,
+                self._door_distance(door_id),
+            )
             yield self.proto.enter_door(door_id)
             return
 
         action = self.teacher.choose(self.world)
         self.last_action_summary = {
+            "objective_type": "combat",
+            "objective_id": action.target_id,
             "target_id": action.target_id,
             "los_clear": action.los_clear,
             "range_ok": action.range_ok,
@@ -297,6 +350,7 @@ class LiveBot:
                 len(room.get("pickups", [])),
                 len(room.get("doors", [])),
             )
+            self._log_known_doors(room)
         elif typ == protocol.S2C_ROOM_LOAD:
             room = data.get("room") or {}
             self.claimed_pickups.clear()
@@ -308,6 +362,7 @@ class LiveBot:
                 len(room.get("pickups", [])),
                 len(room.get("doors", [])),
             )
+            self._log_known_doors(room)
             if room.get("room_index") == 2 and not self.reached_room2:
                 self.reached_room2 = True
                 self.logger.info("SUCCESS: reached room 2")
@@ -360,15 +415,103 @@ class LiveBot:
     def _pickup_claim(
         self, pickup_id: int, hp: int, ammo: int, current_weapon: int
     ) -> tuple[int | None, str]:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        actual_type = int(pickup.get("type", protocol.PICKUP_COIN) or protocol.PICKUP_COIN)
+        if self.pickup_mode == "remote":
+            if hp <= LOW_HEALTH_THRESHOLD:
+                return protocol.PICKUP_HEALTH, "low_hp_remote"
+            if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
+                return protocol.PICKUP_AMMO, "low_ammo_remote"
+            return protocol.PICKUP_COIN, "coin_remote"
+
+        if not self._near_pickup(pickup_id):
+            return None, "not_near_pickup"
+
+        if actual_type == protocol.PICKUP_HEALTH:
+            if hp <= LOW_HEALTH_THRESHOLD:
+                return actual_type, "low_hp"
+            return actual_type, "health_near"
+        if actual_type == protocol.PICKUP_AMMO:
+            if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
+                return actual_type, "low_ammo"
+            return actual_type, "ammo_near"
+        if actual_type == protocol.PICKUP_COIN:
+            if self.pickup_mode == "on-way" and not self._pickup_on_way(pickup_id):
+                return None, "coin_off_path"
+            if self._pickup_on_way(pickup_id):
+                return actual_type, "coin_on_way"
+            return None, "coin_not_on_way"
+        return None, "unknown_pickup_type"
+
+    def _priority_pickup_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
+        wanted_type: int | None = None
         if hp <= LOW_HEALTH_THRESHOLD:
-            return protocol.PICKUP_HEALTH, "low_hp"
-        if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
-            return protocol.PICKUP_AMMO, "low_ammo"
-        if self.pickup_mode == "on-way" and not self._pickup_on_way(pickup_id):
-            return None, "coin_off_path"
-        if self.pickup_mode == "on-way":
-            return protocol.PICKUP_COIN, "coin_on_way"
-        return protocol.PICKUP_COIN, "coin_default"
+            wanted_type = protocol.PICKUP_HEALTH
+        elif (
+            not self.world.enemies
+            and current_weapon in (2, 3)
+            and ammo <= LOW_AMMO_THRESHOLD
+        ):
+            wanted_type = protocol.PICKUP_AMMO
+        if wanted_type is None or self.pickup_mode == "remote":
+            return None
+
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        candidates = [
+            pickup
+            for pickup in self.world.pickups.values()
+            if int(pickup.get("type", 0) or 0) == wanted_type
+        ]
+        if not candidates:
+            return None
+        target = min(
+            candidates,
+            key=lambda pickup: math.hypot(
+                float(pickup.get("x", px) or px) - px,
+                float(pickup.get("y", py) or py) - py,
+            ),
+        )
+        return int(target["entity_id"])
+
+    def _near_pickup(self, pickup_id: int) -> bool:
+        return self._pickup_distance(pickup_id) <= self.pickup_interact_distance
+
+    def _pickup_distance(self, pickup_id: int) -> float:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        dx = float(pickup.get("x", px) or px) - px
+        dy = float(pickup.get("y", py) or py) - py
+        return math.hypot(dx, dy)
+
+    def _pickup_direction(self, pickup_id: int) -> tuple[float, float]:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        tx = float(pickup.get("x", px) or px)
+        ty = float(pickup.get("y", py) or py)
+        try:
+            room = self.geometry.load_room(int(self.world.current_room or 1))
+            if walk_path_clear(room, px, py, tx, ty):
+                return normalize(tx - px, ty - py)
+            routed = room.direction_to_reachable_near_point(
+                px,
+                py,
+                tx,
+                ty,
+                self.pickup_interact_distance,
+            )
+            if routed is None:
+                routed = room.direction_to_point(px, py, tx, ty)
+            if routed is not None:
+                return normalize(*routed)
+        except Exception as exc:
+            self.logger.debug("pickup routing fallback pickup_id=%s error=%s", pickup_id, exc)
+        return normalize(tx - px, ty - py)
 
     def _pickup_on_way(self, pickup_id: int) -> bool:
         pickup = self.world.pickups.get(int(pickup_id)) or {}
@@ -407,6 +550,22 @@ class LiveBot:
 
     def _near_door(self, door_id: int) -> bool:
         return self._door_distance(door_id) <= self.door_enter_distance
+
+    def _log_known_doors(self, room: dict) -> None:
+        doors = room.get("doors", [])
+        if not doors:
+            return
+        summary = [
+            {
+                "door_id": door.get("door_id"),
+                "x": door.get("x"),
+                "y": door.get("y"),
+                "target_room": door.get("target_room"),
+                "locked": door.get("locked"),
+            }
+            for door in doors
+        ]
+        self.logger.info("known doors room=%s doors=%s", room.get("room_index"), summary)
 
     def _door_distance(self, door_id: int) -> float:
         door = self.world.doors.get(int(door_id)) or {}
@@ -492,7 +651,8 @@ def main() -> None:
     parser.add_argument("--stop-room", type=int, default=0)
     parser.add_argument("--no-walk-to-door", action="store_true")
     parser.add_argument("--door-enter-distance", type=float, default=58.0)
-    parser.add_argument("--pickup-mode", choices=("remote", "on-way"), default="remote")
+    parser.add_argument("--pickup-mode", choices=("physical", "on-way", "remote"), default="physical")
+    parser.add_argument("--pickup-interact-distance", type=float, default=PICKUP_INTERACT_DISTANCE)
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -506,6 +666,7 @@ def main() -> None:
         not args.no_walk_to_door,
         args.door_enter_distance,
         args.pickup_mode,
+        args.pickup_interact_distance,
     ).run()
 
 
