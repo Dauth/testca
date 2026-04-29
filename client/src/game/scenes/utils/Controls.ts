@@ -1,0 +1,121 @@
+import Phaser from "phaser";
+
+export type MovementInput = { dx: number; dy: number };
+
+export const CONTROL_BINDINGS: ReadonlyArray<readonly [string, string]> = [
+  ["Move", "W A S D / Arrows"],
+  ["Aim", "Mouse"],
+  ["Shoot", "Left mouse button"],
+  ["Weapons", "1 / 2 / 3"],
+  ["Shop", "B"],
+  ["Menu", "Esc"],
+];
+
+export type Controls = {
+  movement(): MovementInput;
+  aimAngle(pivotX: number, pivotY: number): number;
+  shootHeld(): boolean;
+  shopPressed(): boolean;
+  pausePressed(): boolean;
+  weaponSwitchPressed(): number | null;
+};
+
+type KeyMap = {
+  w: Phaser.Input.Keyboard.Key;
+  a: Phaser.Input.Keyboard.Key;
+  s: Phaser.Input.Keyboard.Key;
+  d: Phaser.Input.Keyboard.Key;
+  up: Phaser.Input.Keyboard.Key;
+  down: Phaser.Input.Keyboard.Key;
+  left: Phaser.Input.Keyboard.Key;
+  right: Phaser.Input.Keyboard.Key;
+  shop: Phaser.Input.Keyboard.Key;
+  pause: Phaser.Input.Keyboard.Key;
+  one: Phaser.Input.Keyboard.Key;
+  two: Phaser.Input.Keyboard.Key;
+  three: Phaser.Input.Keyboard.Key;
+};
+
+
+export function createControls(scene: Phaser.Scene): Controls {
+  const kb = scene.input.keyboard;
+  if (!kb) {
+    
+    
+    return {
+      movement: () => ({ dx: 0, dy: 0 }),
+      aimAngle: () => 0,
+      shootHeld: () => false,
+      shopPressed: () => false,
+      pausePressed: () => false,
+      weaponSwitchPressed: () => null,
+    };
+  }
+
+  const keys: KeyMap = {
+    w: kb.addKey(Phaser.Input.Keyboard.KeyCodes.W, false),
+    a: kb.addKey(Phaser.Input.Keyboard.KeyCodes.A, false),
+    s: kb.addKey(Phaser.Input.Keyboard.KeyCodes.S, false),
+    d: kb.addKey(Phaser.Input.Keyboard.KeyCodes.D, false),
+    up: kb.addKey(Phaser.Input.Keyboard.KeyCodes.UP, false),
+    down: kb.addKey(Phaser.Input.Keyboard.KeyCodes.DOWN, false),
+    left: kb.addKey(Phaser.Input.Keyboard.KeyCodes.LEFT, false),
+    right: kb.addKey(Phaser.Input.Keyboard.KeyCodes.RIGHT, false),
+    shop: kb.addKey(Phaser.Input.Keyboard.KeyCodes.B, false),
+    pause: kb.addKey(Phaser.Input.Keyboard.KeyCodes.ESC, false),
+    one: kb.addKey(Phaser.Input.Keyboard.KeyCodes.ONE, false),
+    two: kb.addKey(Phaser.Input.Keyboard.KeyCodes.TWO, false),
+    three: kb.addKey(Phaser.Input.Keyboard.KeyCodes.THREE, false),
+  };
+
+  const justDown = Phaser.Input.Keyboard.JustDown;
+  
+  
+  
+  
+  let suppressShootUntilRelease = scene.input.activePointer.leftButtonDown();
+
+  return {
+    movement(): MovementInput {
+      let dx = 0;
+      let dy = 0;
+      if (keys.a.isDown || keys.left.isDown) dx -= 1;
+      if (keys.d.isDown || keys.right.isDown) dx += 1;
+      if (keys.w.isDown || keys.up.isDown) dy -= 1;
+      if (keys.s.isDown || keys.down.isDown) dy += 1;
+      const mag = Math.hypot(dx, dy);
+      if (mag > 1) {
+        dx /= mag;
+        dy /= mag;
+      }
+      return { dx, dy };
+    },
+    aimAngle(pivotX: number, pivotY: number): number {
+      const p = scene.input.activePointer;
+      
+      const worldX = Number.isFinite(p.worldX) ? p.worldX : p.x;
+      const worldY = Number.isFinite(p.worldY) ? p.worldY : p.y;
+      return Math.atan2(worldY - pivotY, worldX - pivotX);
+    },
+    shootHeld(): boolean {
+      const down = scene.input.activePointer.leftButtonDown();
+      if (suppressShootUntilRelease) {
+        if (!down) suppressShootUntilRelease = false;
+        return false;
+      }
+      return down;
+    },
+    shopPressed(): boolean {
+      return justDown(keys.shop);
+    },
+    pausePressed(): boolean {
+      return justDown(keys.pause);
+    },
+    weaponSwitchPressed(): number | null {
+      if (justDown(keys.one)) return 1;
+      if (justDown(keys.two)) return 2;
+      if (justDown(keys.three)) return 3;
+      return null;
+    },
+  };
+}
