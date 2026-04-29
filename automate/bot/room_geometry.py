@@ -153,6 +153,87 @@ class ParsedRoom:
             return None
         return dx / mag, dy / mag
 
+    def direction_to_point(
+        self, ax: float, ay: float, bx: float, by: float
+    ) -> tuple[float, float] | None:
+        start = self._nearest_walkable_cell(ax, ay)
+        goal = self._nearest_walkable_cell(bx, by)
+        if start is None or goal is None:
+            return None
+        if start == goal:
+            return None
+
+        q = deque([start])
+        parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        while q:
+            cell = q.popleft()
+            if cell == goal:
+                break
+            for nxt in self._neighbors(cell):
+                if nxt in parent:
+                    continue
+                parent[nxt] = cell
+                q.append(nxt)
+
+        if goal not in parent:
+            return None
+
+        step = goal
+        while parent.get(step) is not None and parent[step] != start:
+            step = parent[step]  # type: ignore[assignment]
+
+        sx, sy = self._cell_center(step)
+        dx = sx - ax
+        dy = sy - ay
+        mag = math.hypot(dx, dy)
+        if mag < 1e-6:
+            return None
+        return dx / mag, dy / mag
+
+    def direction_to_reachable_near_point(
+        self, ax: float, ay: float, bx: float, by: float, radius: float
+    ) -> tuple[float, float] | None:
+        start = self._nearest_walkable_cell(ax, ay)
+        if start is None:
+            return None
+
+        q = deque([start])
+        parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        best = start
+        best_dist = float("inf")
+
+        while q:
+            cell = q.popleft()
+            cx, cy = self._cell_center(cell)
+            dist = math.hypot(bx - cx, by - cy)
+            if dist < best_dist:
+                best_dist = dist
+                best = cell
+            if dist <= radius:
+                best = cell
+                break
+
+            for nxt in self._neighbors(cell):
+                if nxt in parent:
+                    continue
+                parent[nxt] = cell
+                q.append(nxt)
+
+        if best == start:
+            return None
+
+        step = best
+        while parent.get(step) is not None and parent[step] != start:
+            step = parent[step]  # type: ignore[assignment]
+
+        sx, sy = self._cell_center(step)
+        dx = sx - ax
+        dy = sy - ay
+        mag = math.hypot(dx, dy)
+        if mag < 1e-6:
+            return None
+        return dx / mag, dy / mag
+
     def _cell_at(self, x: float, y: float) -> int:
         col = int(x / TILE_SIZE)
         row = int(y / TILE_SIZE)

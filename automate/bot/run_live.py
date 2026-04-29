@@ -9,6 +9,7 @@ import time
 from typing import Iterable
 
 from . import protocol
+from .room_geometry import RoomGeometry
 from .scripted_teacher import ScriptedTeacher
 from .seed_search import choose_seed
 from .world_model import WorldModel
@@ -21,6 +22,8 @@ class LiveBot:
         player_id: str,
         log_dir: str = "automate/runs",
         stop_room: int = 0,
+        walk_to_door: bool = False,
+        door_enter_distance: float = 58.0,
     ):
         self.url = url
         self.player_id = player_id
@@ -28,6 +31,7 @@ class LiveBot:
         self.proto = protocol.ClientProtocol(logger=self.logger)
         self.world = WorldModel()
         self.teacher = ScriptedTeacher()
+        self.geometry = RoomGeometry(Path(__file__).resolve().parents[2])
         self.claimed_pickups: set[int] = set()
         self.last_shot_at = 0.0
         self.last_input_log_at = 0.0
@@ -35,6 +39,8 @@ class LiveBot:
         self.last_action_summary: dict = {}
         self.reached_room2 = False
         self.stop_room = stop_room
+        self.walk_to_door = walk_to_door
+        self.door_enter_distance = door_enter_distance
         self.stop_requested = False
         self.record_path = self._make_record_path(log_dir)
         self.record_file = self.record_path.open("a", encoding="utf-8")
@@ -174,6 +180,26 @@ class LiveBot:
 
         door_id = self.world.best_unlocked_door()
         if door_id is not None:
+            if self.walk_to_door and not self._near_door(door_id):
+                dx, dy = self._door_direction(door_id)
+                self.last_action_summary = {
+                    "target_id": door_id,
+                    "los_clear": True,
+                    "reason": "move_to_door",
+                    "dx": dx,
+                    "dy": dy,
+                    "fire": False,
+                    "weapon_id": None,
+                }
+                self.logger.info(
+                    "move_to_door door_id=%s room=%s dx=%.3f dy=%.3f",
+                    door_id,
+                    self.world.current_room,
+                    dx,
+                    dy,
+                )
+                yield self.proto.input(dx, dy)
+                return
             self.logger.info("enter_door sent door_id=%s room=%s", door_id, self.world.current_room)
             yield self.proto.enter_door(door_id)
             return
@@ -309,6 +335,39 @@ class LiveBot:
     def _summarize_packets(self, packets: list[str]) -> list[str]:
         return [protocol.packet_name(json.loads(packet).get("type")) for packet in packets]
 
+    def _near_door(self, door_id: int) -> bool:
+        door = self.world.doors.get(int(door_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        dx = float(door.get("x", px) or px) - px
+        dy = float(door.get("y", py) or py) - py
+        return math.hypot(dx, dy) <= self.door_enter_distance
+
+    def _door_direction(self, door_id: int) -> tuple[float, float]:
+        door = self.world.doors.get(int(door_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        tx = float(door.get("x", px) or px)
+        ty = float(door.get("y", py) or py)
+        try:
+            room = self.geometry.load_room(int(self.world.current_room or 1))
+            routed = room.direction_to_reachable_near_point(
+                px,
+                py,
+                tx,
+                ty,
+                self.door_enter_distance,
+            )
+            if routed is None:
+                routed = room.direction_to_point(px, py, tx, ty)
+            if routed is not None:
+                return normalize(*routed)
+        except Exception as exc:
+            self.logger.debug("door routing fallback door_id=%s error=%s", door_id, exc)
+        return normalize(tx - px, ty - py)
+
     def _make_record_path(self, log_dir: str) -> Path:
         path = Path(log_dir)
         path.mkdir(parents=True, exist_ok=True)
@@ -330,12 +389,21 @@ def main() -> None:
     parser.add_argument("--log-dir", default="automate/runs")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-room", type=int, default=0)
+    parser.add_argument("--walk-to-door", action="store_true")
+    parser.add_argument("--door-enter-distance", type=float, default=58.0)
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    LiveBot(args.url, args.player_id, args.log_dir, args.stop_room).run()
+    LiveBot(
+        args.url,
+        args.player_id,
+        args.log_dir,
+        args.stop_room,
+        args.walk_to_door,
+        args.door_enter_distance,
+    ).run()
 
 
 if __name__ == "__main__":
