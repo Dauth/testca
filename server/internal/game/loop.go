@@ -245,7 +245,7 @@ func (e *Engine) awaitStartRun(ctx context.Context) bool {
 				e.sendError("bad_start", err.Error())
 				continue
 			}
-			if !e.initRun(pkt.StartTime) {
+			if !e.initRun(pkt.StartTime, pkt.StartRoom) {
 				return false
 			}
 			return true
@@ -253,7 +253,7 @@ func (e *Engine) awaitStartRun(ctx context.Context) bool {
 	}
 }
 
-func (e *Engine) initRun(startTime int64) bool {
+func (e *Engine) initRun(startTime int64, startRoom uint8) bool {
 	now := time.Now()
 	if !e.ReplayMode {
 		seedTime := time.UnixMilli(startTime)
@@ -262,6 +262,13 @@ func (e *Engine) initRun(startTime int64) bool {
 			return false
 		}
 	}
+	if startRoom == 0 {
+		startRoom = 1
+	}
+	if int(startRoom) <= 0 || int(startRoom) >= len(RoomTemplates) || RoomTemplates[startRoom] == nil {
+		e.sendError("bad_start_room", "start_room must reference a valid room")
+		return false
+	}
 	e.run = &RunState{
 		Status:       RunRunning,
 		PlayerID:     e.PlayerID,
@@ -269,18 +276,18 @@ func (e *Engine) initRun(startTime int64) bool {
 		RunStartTime: now,
 		Seed:         startTime,
 		MobRNG:       rand.New(rand.NewSource(startTime)),
-		CurrentRoom:  1,
+		CurrentRoom:  startRoom,
 		Splits:       []protocol.SplitData{},
 		InputLog:     []InputRecord{},
 	}
 	e.player = NewPlayerState()
-	e.room = NewRoomState(1)
+	e.room = NewRoomState(startRoom)
 	e.lastInputAt = now
 
-	tmpl := RoomTemplates[1]
-	roomData := LoadRoom(e.room, e.run.MobRNG, tmpl, TilemapEnemies(1), TilemapWaves(1), now)
+	tmpl := RoomTemplates[startRoom]
+	roomData := LoadRoom(e.room, e.run.MobRNG, tmpl, TilemapEnemies(startRoom), TilemapWaves(startRoom), now)
 
-	placePlayerSpawn(e.player, 1)
+	placePlayerSpawn(e.player, startRoom)
 
 	e.send(protocol.S2CRunStarted, protocol.RunStartedData{
 		Seed:        startTime,
@@ -912,4 +919,3 @@ func clampInput(v float32) float32 {
 	}
 	return v
 }
-

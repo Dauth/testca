@@ -66,8 +66,11 @@ class ClientProtocol:
     def auth(self, player_id: str) -> str:
         return self.envelope(C2S_AUTH, {"player_id": player_id})
 
-    def start_run(self, start_time: int) -> str:
-        return self.envelope(C2S_START_RUN, {"start_time": start_time})
+    def start_run(self, start_time: int, start_room: int = 0) -> str:
+        data: dict[str, Any] = {"start_time": start_time}
+        if start_room:
+            data["start_room"] = int(start_room)
+        return self.envelope(C2S_START_RUN, data)
 
     def input(self, dx: float, dy: float) -> str:
         return self.envelope(C2S_INPUT, {"dx": clamp(dx), "dy": clamp(dy)})

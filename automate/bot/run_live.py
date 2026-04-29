@@ -9,9 +9,11 @@ import time
 from typing import Iterable
 
 from . import protocol
+from .room_plans import get_room_plan
 from .room_geometry import RoomGeometry
 from .scripted_teacher import ScriptedTeacher
 from .seed_search import choose_seed
+from .spawn_catalog import spawn_label
 from .world_model import WorldModel
 
 
@@ -20,6 +22,8 @@ LOW_AMMO_THRESHOLD = 3
 COIN_NEAR_DISTANCE = 140.0
 COIN_PATH_DISTANCE = 96.0
 PICKUP_INTERACT_DISTANCE = 48.0
+WEAPON_SHOTGUN = 3
+BIG_CAT_TYPES = {3, 5}
 
 
 class LiveBot:
@@ -29,6 +33,7 @@ class LiveBot:
         player_id: str,
         log_dir: str = "automate/runs",
         stop_room: int = 0,
+        start_room: int = 0,
         walk_to_door: bool = True,
         door_enter_distance: float = 48.0,
         pickup_mode: str = "physical",
@@ -48,6 +53,7 @@ class LiveBot:
         self.last_action_summary: dict = {}
         self.reached_room2 = False
         self.stop_room = stop_room
+        self.start_room = start_room
         self.walk_to_door = walk_to_door
         self.door_enter_distance = door_enter_distance
         self.pickup_mode = pickup_mode
@@ -77,9 +83,9 @@ class LiveBot:
             self._read_until(ws, {protocol.S2C_AUTH_OK})
             server_now = int(time.time() * 1000) + self.proto.server_offset_ms
             start_time = choose_seed(server_now)
-            start_msg = self.proto.start_run(start_time)
+            start_msg = self.proto.start_run(start_time, self.start_room)
             ws.send(start_msg)
-            self.logger.info("start_run sent start_time=%s", start_time)
+            self.logger.info("start_run sent start_time=%s start_room=%s", start_time, self.start_room or 1)
             self._record("send", {"packets": [json.loads(start_msg)], "reason": "start_run"})
             ws.settimeout(0.001)
 
@@ -157,18 +163,44 @@ class LiveBot:
         if priority_pickup is not None and not self._near_pickup(priority_pickup):
             dx, dy = self._pickup_direction(priority_pickup)
             pickup = self.world.pickups.get(priority_pickup) or {}
+            action = self.teacher.choose(self.world)
             self.last_action_summary = {
                 "objective_type": "pickup",
                 "objective_id": priority_pickup,
                 "pickup_id": priority_pickup,
                 "pickup_type": pickup.get("type"),
-                "pickup_reason": "low_hp" if hp <= LOW_HEALTH_THRESHOLD else "low_ammo",
+                "pickup_reason": self._priority_pickup_reason(hp, priority_pickup),
                 "physical_interact_allowed": False,
                 "dx": dx,
                 "dy": dy,
-                "fire": False,
+                "fire": action.fire,
+                "target_id": action.target_id,
+                "los_clear": action.los_clear,
+                "range_ok": action.range_ok,
+                "distance_to_target": action.distance_to_target,
+                "weapon_id": action.weapon_id,
                 "reason": "move_to_priority_pickup",
+                **self._teacher_debug_fields(action.target_id),
             }
+            if action.weapon_id is not None and action.weapon_id != current_weapon:
+                self.logger.info("switch weapon %s -> %s", current_weapon, action.weapon_id)
+                yield self.proto.switch_weapon(action.weapon_id)
+            if action.fire:
+                now = time.time()
+                if now - self.last_shot_at >= 0.2:
+                    self.logger.info(
+                        "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s distance=%.1f los_clear=%s range_ok=%s reason=%s+pickup",
+                        action.target_id,
+                        action.weapon_id or current_weapon,
+                        action.aim_angle,
+                        len(self.world.enemies),
+                        action.distance_to_target,
+                        action.los_clear,
+                        action.range_ok,
+                        action.reason,
+                    )
+                    self.last_shot_at = now
+                yield self.proto.shoot(float(action.aim_angle))
             self.logger.info(
                 "move_to_pickup id=%s type=%s reason=%s distance=%.1f dx=%.3f dy=%.3f",
                 priority_pickup,
@@ -203,6 +235,10 @@ class LiveBot:
                     current_weapon,
                     ammo,
                 )
+                if pickup_reason.startswith("shotgun_ammo") and current_weapon != WEAPON_SHOTGUN:
+                    self.logger.info("switch weapon %s -> %s for shotgun ammo pickup", current_weapon, WEAPON_SHOTGUN)
+                    self.teacher.empty_weapons.discard(WEAPON_SHOTGUN)
+                    yield self.proto.switch_weapon(WEAPON_SHOTGUN)
             else:
                 self.logger.info("pickup seen id=%s claim=coin reason=%s", pickup_id, pickup_reason)
             self.last_action_summary = {
@@ -286,6 +322,7 @@ class LiveBot:
             "dy": action.dy,
             "fire": action.fire,
             "weapon_id": action.weapon_id,
+            **self._teacher_debug_fields(action.target_id),
         }
         if action.weapon_id is not None and action.weapon_id != current_weapon:
             self.logger.info("switch weapon %s -> %s", current_weapon, action.weapon_id)
@@ -444,10 +481,14 @@ class LiveBot:
             return actual_type, "health_near"
         if actual_type == protocol.PICKUP_AMMO:
             if self.world.enemies:
+                if self._pickup_on_way(pickup_id) and self._should_save_shotgun_ammo(current_weapon, ammo):
+                    return actual_type, "shotgun_ammo_on_way_combat"
                 return None, "skip_ammo_combat"
             if current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD:
                 return actual_type, "low_ammo"
             if self._pickup_on_way(pickup_id):
+                if self._should_save_shotgun_ammo(current_weapon, ammo):
+                    return actual_type, "shotgun_ammo_on_way_safe"
                 return actual_type, "ammo_on_way_safe"
             return None, "skip_ammo_not_needed"
         if actual_type == protocol.PICKUP_COIN:
@@ -461,6 +502,8 @@ class LiveBot:
     def _priority_pickup_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
         wanted_type: int | None = None
         if hp <= LOW_HEALTH_THRESHOLD:
+            wanted_type = protocol.PICKUP_HEALTH
+        elif self._should_collect_pre_door_health(hp):
             wanted_type = protocol.PICKUP_HEALTH
         elif (
             not self.world.enemies
@@ -489,6 +532,34 @@ class LiveBot:
             ),
         )
         return int(target["entity_id"])
+
+    def _priority_pickup_reason(self, hp: int, pickup_id: int) -> str:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        pickup_type = int(pickup.get("type", 0) or 0)
+        if pickup_type == protocol.PICKUP_HEALTH:
+            if hp <= LOW_HEALTH_THRESHOLD:
+                return "low_hp"
+            if self._should_collect_pre_door_health(hp):
+                return "pre_room_health"
+        if pickup_type == protocol.PICKUP_AMMO:
+            return "low_ammo"
+        return "priority_pickup"
+
+    def _should_collect_pre_door_health(self, hp: int) -> bool:
+        if self.world.enemies:
+            return False
+        door_id = self.world.best_unlocked_door()
+        if door_id is None:
+            return False
+        door = self.world.doors.get(int(door_id)) or {}
+        next_room = int(door.get("target_room", 0) or 0)
+        threshold = get_room_plan(next_room).pre_door_health_threshold
+        if threshold is None or hp >= threshold:
+            return False
+        return any(
+            int(pickup.get("type", 0) or 0) == protocol.PICKUP_HEALTH
+            for pickup in self.world.pickups.values()
+        )
 
     def _near_pickup(self, pickup_id: int) -> bool:
         return self._pickup_distance(pickup_id) <= self.pickup_interact_distance
@@ -543,11 +614,38 @@ class LiveBot:
             return False
         return distance_to_segment(x, y, px, py, objective[0], objective[1]) <= COIN_PATH_DISTANCE
 
+    def _should_save_shotgun_ammo(self, current_weapon: int, ammo: int) -> bool:
+        if current_weapon == WEAPON_SHOTGUN and ammo <= LOW_AMMO_THRESHOLD:
+            return True
+        if self._has_big_cat_alive():
+            return True
+        if int(self.world.current_room or 0) >= 8:
+            return True
+        return False
+
+    def _has_big_cat_alive(self) -> bool:
+        return any(
+            int(enemy.get("type", 1) or 1) in BIG_CAT_TYPES
+            for enemy in self.world.enemies.values()
+        )
+
     def _current_objective_point(self) -> tuple[float, float] | None:
         player = self.world.player or {}
         px = float(player.get("x", 0.0) or 0.0)
         py = float(player.get("y", 0.0) or 0.0)
         if self.world.enemies:
+            try:
+                if self.teacher.current_goal_cell is not None:
+                    room = self.geometry.load_room(int(self.world.current_room or 1))
+                    return room._cell_center(self.teacher.current_goal_cell)
+            except Exception:
+                pass
+            route_target = self.world.enemies.get(self.teacher.route_target_id or -1)
+            if route_target is not None:
+                return (
+                    float(route_target.get("x", px) or px),
+                    float(route_target.get("y", py) or py),
+                )
             target = min(
                 self.world.enemies.values(),
                 key=lambda e: math.hypot(
@@ -623,6 +721,41 @@ class LiveBot:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         return path / f"live_debug_{stamp}.jsonl"
 
+    def _teacher_debug_fields(self, target_id: int | None) -> dict:
+        fire_target = self.world.enemies.get(self.teacher.fire_target_id or -1)
+        route_target = self.world.enemies.get(self.teacher.route_target_id or -1)
+        target = self.world.enemies.get(int(target_id or -1))
+        fire_spawn = spawn_label(self.world.current_room, fire_target)
+        route_spawn = spawn_label(self.world.current_room, route_target)
+        target_spawn = spawn_label(self.world.current_room, target)
+        solid_blocked_exists = False
+        try:
+            player = self.world.player or {}
+            px = float(player.get("x", 0.0) or 0.0)
+            py = float(player.get("y", 0.0) or 0.0)
+            room = self.geometry.load_room(int(self.world.current_room or 1))
+            solid_blocked_exists = self.teacher.has_solid_blocked_reachable_cat(self.world, room, px, py)
+        except Exception:
+            solid_blocked_exists = False
+        return {
+            "route_target_id": self.teacher.route_target_id,
+            "fire_target_id": self.teacher.fire_target_id,
+            "movement_goal_cell": self.teacher.current_goal_cell,
+            "goal_reason": self.teacher.goal_reason,
+            "route_mode": self.teacher.route_mode,
+            "stuck_ticks": self.teacher.stuck_ticks,
+            "failed_goal_count": sum(len(cells) for cells in self.teacher.failed_goal_cells.values()),
+            "fire_target_spawn_label": fire_spawn.get("spawn_label"),
+            "route_target_spawn_label": route_spawn.get("spawn_label"),
+            "target_spawn_label": target_spawn.get("spawn_label"),
+            "spawn_phase": target_spawn.get("spawn_phase"),
+            "spawn_group": target_spawn.get("spawn_group"),
+            "distance_to_spawn_base": target_spawn.get("distance_to_spawn_base"),
+            "river_door_shortcut_used": self.teacher.route_mode == "river_door",
+            "solid_blocked_cat_exists": solid_blocked_exists,
+            "room10_survival_mode": self.world.current_room == 10 and self.teacher.route_mode == "spawn_immediate_threat",
+        }
+
 
 def normalize(dx: float, dy: float) -> tuple[float, float]:
     mag = math.hypot(dx, dy)
@@ -664,6 +797,7 @@ def main() -> None:
     parser.add_argument("--log-dir", default="automate/runs")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-room", type=int, default=0)
+    parser.add_argument("--start-room", type=int, default=0)
     parser.add_argument("--no-walk-to-door", action="store_true")
     parser.add_argument("--door-enter-distance", type=float, default=48.0)
     parser.add_argument("--pickup-mode", choices=("physical", "on-way", "remote"), default="physical")
@@ -678,6 +812,7 @@ def main() -> None:
         args.player_id,
         args.log_dir,
         args.stop_room,
+        args.start_room,
         not args.no_walk_to_door,
         args.door_enter_distance,
         args.pickup_mode,

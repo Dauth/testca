@@ -6,6 +6,7 @@ type AuthPacket struct {
 
 type StartRunPacket struct {
 	StartTime int64 `json:"start_time"`
+	StartRoom uint8 `json:"start_room,omitempty"`
 }
 
 type InputPacket struct {
@@ -180,4 +181,3 @@ type DoorUnlockedData struct {
 type EntityDiedData struct {
 	EntityID uint32 `json:"entity_id"`
 }
-
