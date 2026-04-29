@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"log"
+	"net/http"
 
 	_ "modernc.org/sqlite"
 )
@@ -22,6 +23,10 @@ type Player struct {
 	DisplayName string
 }
 
+type Service struct {
+	db *sql.DB
+}
+
 func OpenDB(_ string) (*sql.DB, error) {
 	log.Println("identity: STUB build — every player_id is accepted, no auth")
 	return sql.Open("sqlite", ":memory:")
@@ -29,4 +34,24 @@ func OpenDB(_ string) (*sql.DB, error) {
 
 func Lookup(_ *sql.DB, playerID string) (*Player, error) {
 	return &Player{DisplayName: playerID}, nil
+}
+
+func NewService(db *sql.DB) *Service {
+	return &Service{db: db}
+}
+
+func (s *Service) Register(mux *http.ServeMux) {
+	_ = s
+	mux.HandleFunc("/api/login", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte("identity stub"))
+	})
+	mux.HandleFunc("/api/register", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte("identity stub"))
+	})
+	mux.HandleFunc("/api/verify", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte("identity stub"))
+	})
 }

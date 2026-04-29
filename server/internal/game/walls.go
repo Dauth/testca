@@ -6,6 +6,7 @@ import (
 	"fmt"
 )
 
+//go:embed tilemaps/*.json
 var tilemapsFS embed.FS
 
 const (
@@ -449,4 +450,3 @@ func BlockedAABB(roomIndex uint8, cx, cy, hw, hh float32) bool {
 	}
 	return false
 }
-

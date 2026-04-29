@@ -15,7 +15,13 @@ from .world_model import WorldModel
 
 
 class LiveBot:
-    def __init__(self, url: str, player_id: str, log_dir: str = "automate/runs"):
+    def __init__(
+        self,
+        url: str,
+        player_id: str,
+        log_dir: str = "automate/runs",
+        stop_room: int = 0,
+    ):
         self.url = url
         self.player_id = player_id
         self.logger = logging.getLogger("live-bot")
@@ -25,6 +31,9 @@ class LiveBot:
         self.claimed_pickups: set[int] = set()
         self.last_shot_at = 0.0
         self.last_input_log_at = 0.0
+        self.reached_room2 = False
+        self.stop_room = stop_room
+        self.stop_requested = False
         self.record_path = self._make_record_path(log_dir)
         self.record_file = self.record_path.open("a", encoding="utf-8")
 
@@ -53,15 +62,10 @@ class LiveBot:
             ws.send(start_msg)
             self.logger.info("start_run sent start_time=%s", start_time)
             self._record("send", {"packets": [json.loads(start_msg)], "reason": "start_run"})
+            ws.settimeout(0.001)
 
-            while not self.world.run_complete:
-                raw = None
-                try:
-                    raw = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    pass
-                if raw:
-                    self._apply(raw)
+            while not self.world.run_complete and not self.stop_requested:
+                self._drain_available(ws)
                 packets = list(self._decide_messages())
                 for msg in packets:
                     ws.send(msg)
@@ -91,9 +95,31 @@ class LiveBot:
             if env.get("type") in types:
                 return
 
+    def _drain_available(self, ws) -> int:
+        count = 0
+        while True:
+            try:
+                raw = ws.recv()
+            except TimeoutError:
+                break
+            except Exception as exc:
+                if exc.__class__.__name__ == "WebSocketTimeoutException":
+                    break
+                raise
+            if not raw:
+                break
+            self._apply(raw)
+            count += 1
+        return count
+
     def _apply(self, raw: str | bytes) -> dict:
         env = protocol.decode(raw)
         self.proto.observe_server_ts(env.get("server_ts"))
+        if env.get("type") == protocol.S2C_ERROR:
+            self._log_event(env)
+            self._record("recv", {"packet": env})
+            self.world.apply(env)
+            return env
         self.world.apply(env)
         self._log_event(env)
         self._record("recv", {"packet": env})
@@ -180,6 +206,7 @@ class LiveBot:
         if typ == protocol.S2C_AUTH_OK:
             self.logger.info("auth ok received display_name=%s", data.get("display_name"))
         elif typ == protocol.S2C_RUN_STARTED:
+            self.claimed_pickups.clear()
             room = data.get("room") or {}
             self.logger.info(
                 "run started seed=%s room=%s enemies=%s pickups=%s doors=%s",
@@ -200,6 +227,12 @@ class LiveBot:
                 len(room.get("pickups", [])),
                 len(room.get("doors", [])),
             )
+            if room.get("room_index") == 2 and not self.reached_room2:
+                self.reached_room2 = True
+                self.logger.info("SUCCESS: reached room 2")
+            if self.stop_room and int(room.get("room_index") or 0) >= self.stop_room:
+                self.logger.info("stop-room reached room=%s", room.get("room_index"))
+                self.stop_requested = True
         elif typ == protocol.S2C_STATE:
             self.logger.debug(
                 "state received room=%s elapsed=%s hp=%s enemies=%s pickups=%s coins=%s",
@@ -234,6 +267,7 @@ class LiveBot:
             "player": self.world.player,
             "enemy_count": len(self.world.enemies),
             "pickup_count": len(self.world.pickups),
+            "projectile_count": len(self.world.projectiles),
             **payload,
         }
         self.record_file.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -262,12 +296,13 @@ def main() -> None:
     parser.add_argument("--player-id", default="bot-local")
     parser.add_argument("--log-dir", default="automate/runs")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--stop-room", type=int, default=0)
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    LiveBot(args.url, args.player_id, args.log_dir).run()
+    LiveBot(args.url, args.player_id, args.log_dir, args.stop_room).run()
 
 
 if __name__ == "__main__":

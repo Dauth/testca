@@ -32,6 +32,7 @@ The live bot uses `websocket-client` if run directly:
 python3 -m venv automate/.venv
 automate/.venv/bin/python -m pip install websocket-client
 automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/ws --player-id bot-local --verbose
+automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/ws --player-id bot-local --verbose --stop-room 2
 ```
 
 For fastest offline iteration, put the eventual Go headless runner under `server/internal/...` because Go's `internal` import rule prevents code in this repo-root `automate` folder from importing `server/internal/game` directly.

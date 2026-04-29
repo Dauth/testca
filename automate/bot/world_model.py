@@ -13,6 +13,7 @@ class WorldModel:
     player: dict[str, Any] = field(default_factory=dict)
     enemies: dict[int, dict[str, Any]] = field(default_factory=dict)
     pickups: dict[int, dict[str, Any]] = field(default_factory=dict)
+    projectiles: dict[int, dict[str, Any]] = field(default_factory=dict)
     doors: dict[int, dict[str, Any]] = field(default_factory=dict)
     unlocked_doors: set[int] = field(default_factory=set)
     dead_entities: set[int] = field(default_factory=set)
@@ -52,6 +53,10 @@ class WorldModel:
                 for p in data.get("pickups", [])
                 if int(p.get("entity_id", 0)) not in self.dead_entities
             }
+            self.projectiles = {
+                int(p["proj_id"]): p
+                for p in data.get("projectiles", [])
+            }
         elif typ == protocol.S2C_ROOM_LOAD:
             self.elapsed_ms = int(data.get("split_ms") or self.elapsed_ms)
             self._load_room(data.get("room") or {})
@@ -80,6 +85,7 @@ class WorldModel:
         self.current_room = room.get("room_index")
         self.enemies = {int(e["entity_id"]): e for e in room.get("enemies", [])}
         self.pickups = {int(p["entity_id"]): p for p in room.get("pickups", [])}
+        self.projectiles = {}
         self.doors = {int(d["door_id"]): d for d in room.get("doors", [])}
         self.unlocked_doors = {
             int(d["door_id"]) for d in room.get("doors", []) if not d.get("locked", True)
