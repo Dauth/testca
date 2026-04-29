@@ -7,6 +7,7 @@ import {
   setCachedPlayerId,
 } from "../prefs";
 import { WS_URL } from "../constants";
+import { getConfig } from "../../net/config";
 import {
   ACCENT_PRIMARY,
   BUTTON_HOVER_COLOR,
@@ -1011,6 +1012,8 @@ export class MainMenu extends Phaser.Scene {
     playerId: string,
     password: string,
   ): Promise<boolean> {
+    if (!getConfig().queue_enabled) return true;
+
     let res: Response;
     try {
       res = await fetch("/api/queue/join", {
