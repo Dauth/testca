@@ -21,6 +21,9 @@ LOW_HEALTH_THRESHOLD = 45
 LOW_AMMO_THRESHOLD = 3
 COIN_NEAR_DISTANCE = 140.0
 COIN_PATH_DISTANCE = 96.0
+COIN_ROUTE_NEAR_DISTANCE = 180.0
+COIN_ROUTE_MAX_DETOUR = 220.0
+COIN_ROUTE_MAX_NEEDED = 3
 PICKUP_INTERACT_DISTANCE = 48.0
 WEAPON_SHOTGUN = 3
 BIG_CAT_TYPES = {3, 5}
@@ -254,23 +257,53 @@ class LiveBot:
             }
             yield self.proto.interact(pickup_id, pickup_type)
 
-        # Direct shop purchases. Spend toward combat speed first; ammo only when
-        # the active limited-ammo weapon is low. In physical modes, avoid
-        # invisible protocol-only upgrades so the visible run reflects movement.
-        if self.pickup_mode == "remote":
-            coins = int(self.world.player.get("coins", 0) or 0)
-            for item_id, cost in (
-                (protocol.SHOP_DAMAGE, 20),
-                (protocol.SHOP_FIRE_RATE, 15),
-                (protocol.SHOP_SPEED, 10),
-                (protocol.SHOP_AMMO, 5),
-            ):
-                while coins >= cost:
-                    if item_id == protocol.SHOP_AMMO and ammo > 3:
-                        break
-                    coins -= cost
-                    self.logger.info("shop purchase sent item_id=%s remaining_estimated_coins=%s", item_id, coins)
-                    yield self.proto.shop_purchase(item_id)
+        # Shop is a menu/protocol action, unlike physical pickups and doors.
+        # Use it only when safe so upgrades never interrupt combat.
+        shop_purchases = self._safe_shop_purchases(hp, ammo, current_weapon)
+        if shop_purchases:
+            self.last_action_summary = {
+                "objective_type": "shop",
+                "shop_purchases": shop_purchases,
+                "reason": "safe_shop_purchase",
+                "nearest_enemy_distance": self._nearest_enemy_distance(),
+                **self._teacher_debug_fields(None),
+            }
+            for item_id in shop_purchases:
+                self.logger.info("shop purchase sent item_id=%s mode=safe_physical", item_id)
+                yield self.proto.shop_purchase(item_id)
+
+        if not shop_purchases:
+            coin_target = self._priority_coin_target(hp, ammo, current_weapon)
+            if coin_target is not None and not self._near_pickup(coin_target):
+                dx, dy = self._pickup_direction(coin_target)
+                self.last_action_summary = {
+                    "objective_type": "pickup",
+                    "objective_id": coin_target,
+                    "pickup_id": coin_target,
+                    "pickup_type": protocol.PICKUP_COIN,
+                    "pickup_reason": "coin_to_next_shop",
+                    "coin_detour": round(self._coin_detour_cost(coin_target), 1),
+                    "coins_needed_for_next_shop": self._coins_needed_for_next_shop_purchase(
+                        hp, ammo, current_weapon
+                    ),
+                    "physical_interact_allowed": False,
+                    "dx": dx,
+                    "dy": dy,
+                    "fire": False,
+                    "weapon_id": None,
+                    "reason": "move_to_coin_for_shop",
+                    **self._teacher_debug_fields(None),
+                }
+                self.logger.info(
+                    "move_to_coin id=%s reason=coin_to_next_shop needed=%s detour=%.1f dx=%.3f dy=%.3f",
+                    coin_target,
+                    self.last_action_summary["coins_needed_for_next_shop"],
+                    self.last_action_summary["coin_detour"],
+                    dx,
+                    dy,
+                )
+                yield self.proto.input(dx, dy)
+                return
 
         door_id = self.world.best_unlocked_door()
         if door_id is not None:
@@ -627,6 +660,146 @@ class LiveBot:
         if int(self.world.current_room or 0) >= 8:
             return True
         return False
+
+    def _safe_shop_purchases(self, hp: int, ammo: int, current_weapon: int) -> list[int]:
+        if self.pickup_mode == "remote":
+            shop_safe = True
+        else:
+            shop_safe = not self.world.enemies or self._nearest_enemy_distance() > 260.0
+        if not shop_safe:
+            return []
+
+        player = self.world.player or {}
+        coins = int(player.get("coins", 0) or 0)
+        speed = int(player.get("speed_stacks", 0) or 0)
+        fire_rate = int(player.get("fire_rate_stacks", 0) or 0)
+        damage = int(player.get("damage_stacks", 0) or 0)
+        room = int(self.world.current_room or 1)
+        no_enemies = not self.world.enemies
+        limited_ammo_low = current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD
+        purchases: list[int] = []
+
+        def buy(item_id: int, cost: int) -> bool:
+            nonlocal coins
+            if coins < cost:
+                return False
+            coins -= cost
+            purchases.append(item_id)
+            return True
+
+        if no_enemies and room >= 9 and limited_ammo_low:
+            buy(protocol.SHOP_AMMO, 5)
+
+        while speed < 2 and buy(protocol.SHOP_SPEED, 10):
+            speed += 1
+
+        while fire_rate < 3 and buy(protocol.SHOP_FIRE_RATE, 15):
+            fire_rate += 1
+
+        while speed < 4 and buy(protocol.SHOP_SPEED, 10):
+            speed += 1
+
+        while fire_rate < 5 and buy(protocol.SHOP_FIRE_RATE, 15):
+            fire_rate += 1
+
+        while self._next_damage_stack_useful(damage) and buy(protocol.SHOP_DAMAGE, 20):
+            damage += 1
+
+        if no_enemies and limited_ammo_low:
+            buy(protocol.SHOP_AMMO, 5)
+
+        return purchases
+
+    def _priority_coin_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
+        if self.pickup_mode == "remote" or self.world.enemies:
+            return None
+        needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
+        if needed <= 0 or needed > COIN_ROUTE_MAX_NEEDED:
+            return None
+
+        candidates = self._coin_route_candidates()
+        if len(candidates) < needed:
+            return None
+        target = min(candidates, key=lambda pickup: self._coin_detour_cost(int(pickup["entity_id"])))
+        return int(target["entity_id"])
+
+    def _coin_route_candidates(self) -> list[dict]:
+        candidates: list[dict] = []
+        for pickup in self.world.pickups.values():
+            if int(pickup.get("type", 0) or 0) != protocol.PICKUP_COIN:
+                continue
+            pickup_id = int(pickup.get("entity_id", 0) or 0)
+            if pickup_id in self.claimed_pickups:
+                continue
+            dist = self._pickup_distance(pickup_id)
+            detour = self._coin_detour_cost(pickup_id)
+            if dist <= COIN_ROUTE_NEAR_DISTANCE or detour <= COIN_ROUTE_MAX_DETOUR:
+                candidates.append(pickup)
+        return candidates
+
+    def _coin_detour_cost(self, pickup_id: int) -> float:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        cx = float(pickup.get("x", px) or px)
+        cy = float(pickup.get("y", py) or py)
+        objective = self._current_objective_point()
+        direct = 0.0
+        via_coin = math.hypot(cx - px, cy - py)
+        if objective is not None:
+            ox, oy = objective
+            direct = math.hypot(ox - px, oy - py)
+            via_coin += math.hypot(ox - cx, oy - cy)
+        return max(0.0, via_coin - direct)
+
+    def _coins_needed_for_next_shop_purchase(self, hp: int, ammo: int, current_weapon: int) -> int:
+        player = self.world.player or {}
+        coins = int(player.get("coins", 0) or 0)
+        speed = int(player.get("speed_stacks", 0) or 0)
+        fire_rate = int(player.get("fire_rate_stacks", 0) or 0)
+        damage = int(player.get("damage_stacks", 0) or 0)
+        room = int(self.world.current_room or 1)
+        no_enemies = not self.world.enemies
+        limited_ammo_low = current_weapon in (2, 3) and ammo <= LOW_AMMO_THRESHOLD
+
+        if no_enemies and room >= 9 and limited_ammo_low and coins < 5:
+            return 5 - coins
+        if speed < 2 and coins < 10:
+            return 10 - coins
+        if fire_rate < 3 and coins < 15:
+            return 15 - coins
+        if speed < 4 and coins < 10:
+            return 10 - coins
+        if fire_rate < 5 and coins < 15:
+            return 15 - coins
+        if self._next_damage_stack_useful(damage) and coins < 20:
+            return 20 - coins
+        if no_enemies and limited_ammo_low and coins < 5:
+            return 5 - coins
+        return 0
+
+    def _next_damage_stack_useful(self, damage_stacks: int) -> bool:
+        next_stack = damage_stacks + 1
+
+        def dmg(base: int, stacks: int) -> int:
+            return int(base * (1.0 + 0.1 * stacks))
+
+        return (
+            dmg(6, next_stack) > dmg(6, damage_stacks)
+            or dmg(2, next_stack) > dmg(2, damage_stacks)
+        )
+
+    def _nearest_enemy_distance(self) -> float:
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        if not self.world.enemies:
+            return 9999.0
+        return min(
+            math.hypot(float(enemy.get("x", px) or px) - px, float(enemy.get("y", py) or py) - py)
+            for enemy in self.world.enemies.values()
+        )
 
     def _has_big_cat_alive(self) -> bool:
         return any(
