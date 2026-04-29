@@ -187,25 +187,6 @@ class ScriptedTeacher:
             self.fire_target_id = None
             return None, False
 
-        close_small = [
-            enemy
-            for enemy in visible
-            if int(enemy.get("type", 1) or 1) in SMALL_CAT_TYPES
-            and distance(px, py, float(enemy["x"]), float(enemy["y"])) <= IDEAL_FIRE_MAX
-        ]
-        if close_small:
-            target = min(
-                close_small,
-                key=lambda enemy: (
-                    int(enemy.get("hp", 1) or 1),
-                    0 if int(enemy.get("type", 1) or 1) in FAST_CAT_TYPES else 1,
-                    distance(px, py, float(enemy["x"]), float(enemy["y"])),
-                    int(enemy.get("entity_id", 0) or 0),
-                ),
-            )
-            self.fire_target_id = int(target["entity_id"])
-            return target, True
-
         nearest = min(distance(px, py, float(e["x"]), float(e["y"])) for e in visible)
         nearest_band = [
             enemy
@@ -216,6 +197,7 @@ class ScriptedTeacher:
             nearest_band,
             key=lambda enemy: (
                 int(enemy.get("hp", 1) or 1),
+                0 if int(enemy.get("type", 1) or 1) in FAST_CAT_TYPES else 1,
                 distance(px, py, float(enemy["x"]), float(enemy["y"])),
                 int(enemy.get("entity_id", 0) or 0),
             ),
@@ -562,6 +544,9 @@ class ScriptedTeacher:
         )
         if IDEAL_FIRE_MIN <= tdist <= IDEAL_FIRE_MAX and nearest_enemy_dist >= MIN_SHOOT_DISTANCE:
             self.current_goal_cell = None
+            door_bias = self.combat_door_bias(world, px, py)
+            if door_bias is not None:
+                return self.avoid_trap_move(world, px, py, door_bias[0], door_bias[1])
             return 0.0, 0.0
 
         if tdist < MIN_SHOOT_DISTANCE or tdist > IDEAL_FIRE_MAX:
@@ -599,10 +584,42 @@ class ScriptedTeacher:
             vx += tx / tdist * 0.7
             vy += ty / tdist * 0.7
 
+        door_bias = self.combat_door_bias(world, px, py)
+        if door_bias is not None:
+            plan = get_room_plan(world.current_room)
+            vx += door_bias[0] * plan.combat_door_bias_weight
+            vy += door_bias[1] * plan.combat_door_bias_weight
+
         mag = math.hypot(vx, vy)
         if mag < 1e-6:
             return 0.0, 0.0
         return self.avoid_trap_move(world, px, py, vx / mag, vy / mag)
+
+    def combat_door_bias(self, world: WorldModel, px: float, py: float) -> tuple[float, float] | None:
+        plan = get_room_plan(world.current_room)
+        if plan.combat_door_bias_enemy_count is None or plan.combat_door_bias_weight <= 0.0:
+            return None
+        if not world.enemies or len(world.enemies) > plan.combat_door_bias_enemy_count:
+            return None
+        door = self.known_door_point(world)
+        if door is None:
+            return None
+        nearest_enemy_dist = min(
+            (
+                distance(px, py, float(enemy["x"]), float(enemy["y"]))
+                for enemy in world.enemies.values()
+            ),
+            default=999.0,
+        )
+        if nearest_enemy_dist < MIN_SHOOT_DISTANCE:
+            return None
+        room = self.geometry.load_room(int(world.current_room or 1))
+        routed = room.direction_to_reachable_near_point(px, py, door[0], door[1], 48.0)
+        if routed is None:
+            routed = room.direction_to_point(px, py, door[0], door[1])
+        if routed is None:
+            return None
+        return normalize_pair(*routed)
 
     def reposition_for_los(
         self, world: WorldModel, px: float, py: float, target: dict[str, Any]
@@ -1140,8 +1157,13 @@ class ScriptedTeacher:
         if distance(px, py, door[0], door[1]) > RIVER_DOOR_CLOSE_DISTANCE:
             return False
         room = self.geometry.load_room(int(world.current_room or 1))
-        if plan.river_door_requires_no_blocked_cats and self.has_solid_blocked_reachable_cat(world, room, px, py):
-            return False
+        if plan.river_door_requires_no_blocked_cats:
+            if plan.obstacle_spawn_groups:
+                for enemy in world.enemies.values():
+                    if spawn_group(world.current_room, enemy) in plan.obstacle_spawn_groups:
+                        return False
+            if self.has_solid_blocked_reachable_cat(world, room, px, py):
+                return False
         for enemy in world.enemies.values():
             ex = float(enemy["x"])
             ey = float(enemy["y"])

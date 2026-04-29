@@ -250,6 +250,7 @@ class LiveBot:
                 "physical_interact_allowed": self._near_pickup(pickup_id) or self.pickup_mode == "remote",
                 "distance_to_pickup": self._pickup_distance(pickup_id),
                 "reason": "interact_pickup",
+                **self._teacher_debug_fields(None),
             }
             yield self.proto.interact(pickup_id, pickup_type)
 
@@ -290,6 +291,7 @@ class LiveBot:
                     "door_id": door_id,
                     "distance_to_door": self._door_distance(door_id),
                     "physical_interact_allowed": False,
+                    **self._teacher_debug_fields(None),
                 }
                 self.logger.info(
                     "move_to_door door_id=%s room=%s dx=%.3f dy=%.3f",
@@ -612,7 +614,10 @@ class LiveBot:
         objective = self._current_objective_point()
         if objective is None:
             return False
-        return distance_to_segment(x, y, px, py, objective[0], objective[1]) <= COIN_PATH_DISTANCE
+        path_distance = get_room_plan(self.world.current_room).coin_path_distance
+        if path_distance is None:
+            path_distance = COIN_PATH_DISTANCE
+        return distance_to_segment(x, y, px, py, objective[0], objective[1]) <= path_distance
 
     def _should_save_shotgun_ammo(self, current_weapon: int, ammo: int) -> bool:
         if current_weapon == WEAPON_SHOTGUN and ammo <= LOW_AMMO_THRESHOLD:
@@ -722,12 +727,14 @@ class LiveBot:
         return path / f"live_debug_{stamp}.jsonl"
 
     def _teacher_debug_fields(self, target_id: int | None) -> dict:
+        plan = get_room_plan(self.world.current_room)
         fire_target = self.world.enemies.get(self.teacher.fire_target_id or -1)
         route_target = self.world.enemies.get(self.teacher.route_target_id or -1)
         target = self.world.enemies.get(int(target_id or -1))
         fire_spawn = spawn_label(self.world.current_room, fire_target)
         route_spawn = spawn_label(self.world.current_room, route_target)
         target_spawn = spawn_label(self.world.current_room, target)
+        hp = int((self.world.player or {}).get("hp", 100) or 100)
         solid_blocked_exists = False
         try:
             player = self.world.player or {}
@@ -738,9 +745,11 @@ class LiveBot:
         except Exception:
             solid_blocked_exists = False
         return {
+            "room_plan_name": plan.name,
             "route_target_id": self.teacher.route_target_id,
             "fire_target_id": self.teacher.fire_target_id,
             "movement_goal_cell": self.teacher.current_goal_cell,
+            "current_goal_cell": self.teacher.current_goal_cell,
             "goal_reason": self.teacher.goal_reason,
             "route_mode": self.teacher.route_mode,
             "stuck_ticks": self.teacher.stuck_ticks,
@@ -748,12 +757,14 @@ class LiveBot:
             "fire_target_spawn_label": fire_spawn.get("spawn_label"),
             "route_target_spawn_label": route_spawn.get("spawn_label"),
             "target_spawn_label": target_spawn.get("spawn_label"),
+            "target_spawn_group": target_spawn.get("spawn_group"),
             "spawn_phase": target_spawn.get("spawn_phase"),
             "spawn_group": target_spawn.get("spawn_group"),
             "distance_to_spawn_base": target_spawn.get("distance_to_spawn_base"),
             "river_door_shortcut_used": self.teacher.route_mode == "river_door",
             "solid_blocked_cat_exists": solid_blocked_exists,
             "room10_survival_mode": self.world.current_room == 10 and self.teacher.route_mode == "spawn_immediate_threat",
+            "pre_door_health_active": self._should_collect_pre_door_health(hp),
         }
 
 
