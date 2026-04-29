@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +40,7 @@ SHOP_DAMAGE = 4
 class ClientProtocol:
     seq: int = 0
     server_offset_ms: int = 0
+    logger: logging.Logger | None = None
 
     def now_ms(self) -> int:
         return int(time.time() * 1000) + self.server_offset_ms
@@ -49,6 +51,8 @@ class ClientProtocol:
 
     def envelope(self, packet_type: int, data: dict[str, Any]) -> str:
         self.seq += 1
+        if self.logger is not None:
+            self.logger.debug("send %s seq=%s data=%s", packet_name(packet_type), self.seq, data)
         return json.dumps(
             {
                 "type": packet_type,
@@ -99,3 +103,26 @@ def clamp(value: float) -> float:
     if value > 1.0:
         return 1.0
     return float(value)
+
+
+def packet_name(packet_type: int | None) -> str:
+    names = {
+        C2S_AUTH: "C2S_AUTH",
+        C2S_START_RUN: "C2S_START_RUN",
+        C2S_INPUT: "C2S_INPUT",
+        C2S_SHOOT: "C2S_SHOOT",
+        C2S_SWITCH_WEAPON: "C2S_SWITCH_WEAPON",
+        C2S_INTERACT: "C2S_INTERACT",
+        C2S_ENTER_DOOR: "C2S_ENTER_DOOR",
+        C2S_SHOP_PURCHASE: "C2S_SHOP_PURCHASE",
+        S2C_AUTH_OK: "S2C_AUTH_OK",
+        S2C_RUN_STARTED: "S2C_RUN_STARTED",
+        S2C_STATE: "S2C_STATE",
+        S2C_ROOM_LOAD: "S2C_ROOM_LOAD",
+        S2C_RUN_COMPLETE: "S2C_RUN_COMPLETE",
+        S2C_LEADERBOARD: "S2C_LEADERBOARD",
+        S2C_ERROR: "S2C_ERROR",
+        S2C_DOOR_UNLOCKED: "S2C_DOOR_UNLOCKED",
+        S2C_ENTITY_DIED: "S2C_ENTITY_DIED",
+    }
+    return names.get(packet_type, f"UNKNOWN_{packet_type}")

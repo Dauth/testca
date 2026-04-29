@@ -21,10 +21,15 @@ class WorldModel:
     run_complete: bool = False
     outcome: str | None = None
     total_ms: int | None = None
+    latest_server_ts: int | None = None
+    last_error: str | None = None
 
     def apply(self, env: dict[str, Any]) -> None:
         typ = env.get("type")
         data = env.get("data") or {}
+        server_ts = env.get("server_ts")
+        if isinstance(server_ts, int):
+            self.latest_server_ts = server_ts
 
         if typ == protocol.S2C_RUN_STARTED:
             self.seed = data.get("seed")
@@ -68,7 +73,8 @@ class WorldModel:
             self.total_ms = data.get("total_ms")
             self.splits = data.get("splits") or []
         elif typ == protocol.S2C_ERROR:
-            raise RuntimeError(f"{data.get('code')}: {data.get('message')}")
+            self.last_error = f"{data.get('code')}: {data.get('message')}"
+            raise RuntimeError(self.last_error)
 
     def _load_room(self, room: dict[str, Any]) -> None:
         self.current_room = room.get("room_index")

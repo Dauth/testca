@@ -54,24 +54,15 @@ class ScriptedTeacher:
             target_id=int(target["entity_id"]),
         )
 
-    def choose_target(
-        self, world: WorldModel, px: float, py: float
-    ) -> dict[str, Any] | None:
-        best_score = -1e9
+    def choose_target(self, world: WorldModel, px: float, py: float) -> dict[str, Any] | None:
+        best_dist = float("inf")
         best = None
         for enemy in world.enemies.values():
             ex = float(enemy["x"])
             ey = float(enemy["y"])
-            hp = max(1.0, float(enemy.get("hp", 1)))
             dist = math.hypot(ex - px, ey - py)
-            etype = int(enemy.get("type", 1))
-            threat = ENEMY_THREAT.get(etype, 1.0)
-            cluster = self.cluster_score(world, ex, ey)
-            score = threat * 120.0 + cluster * 35.0 - hp * 10.0 - dist * 0.04
-            if dist < 120:
-                score += 80.0
-            if score > best_score:
-                best_score = score
+            if dist < best_dist:
+                best_dist = dist
                 best = enemy
         return best
 
@@ -86,13 +77,13 @@ class ScriptedTeacher:
 
         # State packets only expose ammo for the current weapon. Use conservative
         # switching unless the current weapon is known to be loaded.
-        if current == WEAPON_SHOTGUN and ammo > 0 and (cluster >= 2 or hp >= 8):
+        if current == WEAPON_SHOTGUN and ammo > 0 and dist < 280 and (cluster >= 2 or hp >= 8):
             return WEAPON_SHOTGUN
         if current == WEAPON_RIFLE and ammo > 0:
             return WEAPON_RIFLE
-        if dist < 260 and (cluster >= 2 or hp >= 8):
+        if dist < 220 and (cluster >= 3 or hp >= 10):
             return WEAPON_SHOTGUN
-        return WEAPON_RIFLE if current == WEAPON_RIFLE and ammo > 0 else WEAPON_PISTOL
+        return WEAPON_PISTOL
 
     def choose_movement(
         self, world: WorldModel, px: float, py: float, target: dict[str, Any]
