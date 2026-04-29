@@ -31,6 +31,8 @@ RIVER_DOOR_CLOSE_DISTANCE = 520.0
 GOAL_REACHED_DISTANCE = 24.0
 GOAL_LOCK_TICKS = 18
 STUCK_TICKS_FOR_REPLAN = 8
+TRAPPED_WALL_PRESSURE = 10.0
+TRAPPED_ESCAPE_SPACE = 2
 
 ENEMY_THREAT = {
     1: 1.0,  # grunt
@@ -515,6 +517,9 @@ class ScriptedTeacher:
         if fire_target is not None:
             fdist = distance(px, py, float(fire_target["x"]), float(fire_target["y"]))
             if fdist < MIN_SHOOT_DISTANCE:
+                breakthrough = self.break_out_if_trapped(world, px, py)
+                if breakthrough is not None:
+                    return breakthrough
                 return self.escape_close_threats(world, px, py, fire_target)
 
         if self.route_mode == "river_door" and self.should_use_river_door_shortcut(world, px, py):
@@ -750,10 +755,12 @@ class ScriptedTeacher:
         desired = (dx, dy)
         if not self.move_is_trappy(world, room, px, py, desired[0], desired[1]):
             return desired
+        trapped_now = self.is_trapped_now(world, room, px, py)
         candidates = [
             desired,
             normalize_pair(dx * 0.85 - dy * 0.5, dy * 0.85 + dx * 0.5),
             normalize_pair(dx * 0.85 + dy * 0.5, dy * 0.85 - dx * 0.5),
+            normalize_pair(-dx, -dy),
             normalize_pair(-dy, dx),
             normalize_pair(dy, -dx),
             *CANDIDATE_DIRS[:-1],
@@ -809,8 +816,14 @@ class ScriptedTeacher:
                 score += min(nearest_enemy, 260.0) * 1.4 * weight
                 if nearest_enemy < EMERGENCY_SHOOT_DISTANCE:
                     score -= (EMERGENCY_SHOOT_DISTANCE - nearest_enemy) * 12.0 * weight
-                if current_nearest < MIN_SHOOT_DISTANCE and nearest_enemy < current_nearest:
+                if (
+                    not trapped_now
+                    and current_nearest < MIN_SHOOT_DISTANCE
+                    and nearest_enemy < current_nearest
+                ):
                     score -= (current_nearest - nearest_enemy) * 16.0 * weight
+                if trapped_now and lookahead >= 84.0:
+                    score += max(0.0, nearest_enemy - current_nearest) * 5.0 * weight
 
             if blocked and (cx, cy) == desired:
                 score -= 600.0
@@ -850,6 +863,83 @@ class ScriptedTeacher:
             if current_nearest < MIN_SHOOT_DISTANCE and nearest_enemy < current_nearest - 8.0:
                 return True
         return False
+
+    def is_trapped_now(self, world: WorldModel, room: Any, px: float, py: float) -> bool:
+        cell = room._nearest_walkable_cell(px, py)
+        escape_space = room.escape_space(cell) if cell is not None else 0
+        wall_pressure = self.wall_pressure(room, px, py)
+        close_enemies = sum(
+            1
+            for enemy in world.enemies.values()
+            if distance(px, py, float(enemy["x"]), float(enemy["y"])) <= MIN_SHOOT_DISTANCE
+        )
+        return (
+            escape_space <= TRAPPED_ESCAPE_SPACE
+            or wall_pressure >= TRAPPED_WALL_PRESSURE
+            or close_enemies >= 2
+            or self.stuck_ticks >= max(2, STUCK_TICKS_FOR_REPLAN // 2)
+        )
+
+    def break_out_if_trapped(
+        self, world: WorldModel, px: float, py: float
+    ) -> tuple[float, float] | None:
+        room = self.geometry.load_room(int(world.current_room or 1))
+        if not self.is_trapped_now(world, room, px, py):
+            return None
+
+        current_nearest = min(
+            (
+                distance(px, py, float(enemy["x"]), float(enemy["y"]))
+                for enemy in world.enemies.values()
+            ),
+            default=999.0,
+        )
+        best: tuple[float, float] | None = None
+        best_score = float("-inf")
+        for dx, dy in CANDIDATE_DIRS[:-1]:
+            mag = math.hypot(dx, dy)
+            if mag < 1e-6:
+                continue
+            dx /= mag
+            dy /= mag
+            if room.blocked_aabb(px + dx * 18.0, py + dy * 18.0):
+                continue
+
+            score = 0.0
+            blocked = False
+            for lookahead, weight in ((40.0, 0.7), (96.0, 1.0), (168.0, 1.25), (240.0, 1.4)):
+                test_x = px + dx * lookahead
+                test_y = py + dy * lookahead
+                if room.blocked_aabb(test_x, test_y):
+                    score -= 1200.0 * weight
+                    blocked = True
+                    break
+                cell = room._nearest_walkable_cell(test_x, test_y)
+                escape_space = room.escape_space(cell) if cell is not None else 0
+                wall_pressure = self.wall_pressure(room, test_x, test_y)
+                nearest_enemy = min(
+                    (
+                        distance(test_x, test_y, float(enemy["x"]), float(enemy["y"]))
+                        for enemy in world.enemies.values()
+                    ),
+                    default=999.0,
+                )
+
+                score += escape_space * 180.0 * weight
+                score -= wall_pressure * 140.0 * weight
+                score += min(nearest_enemy, 320.0) * 2.0 * weight
+                if lookahead >= 96.0 and nearest_enemy > current_nearest:
+                    score += (nearest_enemy - current_nearest) * 5.0 * weight
+                if escape_space <= 1:
+                    score -= 800.0 * weight
+
+            if blocked:
+                score -= 200.0
+            if score > best_score:
+                best_score = score
+                best = (dx, dy)
+
+        return best
 
     def route_to_line_of_fire_position(
         self,
@@ -934,6 +1024,9 @@ class ScriptedTeacher:
         room = self.geometry.load_room(int(world.current_room or 1))
         tx = float(target["x"])
         ty = float(target["y"])
+        breakthrough = self.break_out_if_trapped(world, px, py)
+        if breakthrough is not None:
+            return breakthrough
         away_x = px - tx
         away_y = py - ty
         away_mag = max(1.0, math.hypot(away_x, away_y))

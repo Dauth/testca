@@ -265,18 +265,18 @@ class LiveBot:
             yield self.proto.interact(pickup_id, pickup_type)
 
         # Shop is a menu/protocol action, unlike physical pickups and doors.
-        # Use it only when safe so upgrades never interrupt combat.
+        # Send purchases opportunistically; they do not require physical walking.
         shop_purchases = self._safe_shop_purchases(hp, ammo, current_weapon)
         if shop_purchases:
             self.last_action_summary = {
                 "objective_type": "shop",
                 "shop_purchases": shop_purchases,
-                "reason": "safe_shop_purchase",
+                "reason": "shop_purchase",
                 "nearest_enemy_distance": self._nearest_enemy_distance(),
                 **self._teacher_debug_fields(None),
             }
             for item_id in shop_purchases:
-                self.logger.info("shop purchase sent item_id=%s mode=safe_physical", item_id)
+                self.logger.info("shop purchase sent item_id=%s mode=opportunistic", item_id)
                 yield self.proto.shop_purchase(item_id)
 
         if not shop_purchases:
@@ -682,13 +682,6 @@ class LiveBot:
         return False
 
     def _safe_shop_purchases(self, hp: int, ammo: int, current_weapon: int) -> list[int]:
-        if self.pickup_mode == "remote":
-            shop_safe = True
-        else:
-            shop_safe = not self.world.enemies or self._nearest_enemy_distance() > 260.0
-        if not shop_safe:
-            return []
-
         player = self.world.player or {}
         coins = int(player.get("coins", 0) or 0)
         speed = int(player.get("speed_stacks", 0) or 0)
