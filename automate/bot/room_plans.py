@@ -11,6 +11,7 @@ class RoomPlan:
     obstacle_targets_first: bool = True
     allow_river_door_shortcut: bool = False
     river_door_requires_no_blocked_cats: bool = True
+    river_door_blocking_groups: set[str] = field(default_factory=set)
     preferred_firing_tiles: list[tuple[int, int]] = field(default_factory=list)
     flank_goals: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     kite_loop: list[tuple[int, int]] = field(default_factory=list)
@@ -22,6 +23,8 @@ class RoomPlan:
     combat_door_bias_weight: float = 0.0
     coin_path_distance: float | None = None
     pre_door_health_threshold: int | None = None
+    force_motion_when_ideal: bool = False
+    survival_mode: bool = False
     notes: str = ""
 
 
@@ -61,6 +64,9 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         obstacle_targets_first=True,
         allow_river_door_shortcut=False,
         obstacle_spawn_groups={"big_cat"},
+        combat_door_bias_enemy_count=1,
+        combat_door_bias_weight=0.25,
+        force_motion_when_ideal=True,
         notes="Shoot while escaping close starts; commit to LOS routing for the right-side tank.",
     ),
     4: RoomPlan(
@@ -71,6 +77,9 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         allow_river_door_shortcut=False,
         immediate_threat_spawn_groups={"immediate_threat"},
         obstacle_spawn_groups={"big_cat"},
+        combat_door_bias_enemy_count=3,
+        combat_door_bias_weight=0.20,
+        force_motion_when_ideal=True,
         notes="Handle kamikaze and runner threats first, then clear far/left wave cats before door.",
     ),
     5: RoomPlan(
@@ -80,7 +89,11 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         obstacle_targets_first=True,
         allow_river_door_shortcut=True,
         river_door_requires_no_blocked_cats=True,
+        river_door_blocking_groups={"obstacle_group"},
         obstacle_spawn_groups={"obstacle_group"},
+        combat_door_bias_enemy_count=2,
+        combat_door_bias_weight=0.35,
+        force_motion_when_ideal=True,
         notes="Clear solid-obstacle cats before using the river-to-door shortcut.",
     ),
     6: RoomPlan(
@@ -91,6 +104,9 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         allow_river_door_shortcut=False,
         immediate_threat_spawn_groups={"immediate_threat"},
         obstacle_spawn_groups={"big_cat"},
+        combat_door_bias_enemy_count=2,
+        combat_door_bias_weight=0.25,
+        force_motion_when_ideal=True,
         notes="Clear far/right tanks and lower threats before committing to the door route.",
     ),
     7: RoomPlan(
@@ -101,6 +117,9 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         allow_river_door_shortcut=False,
         flank_spawn_groups={"flank_required_group"},
         immediate_threat_spawn_groups={"immediate_threat"},
+        combat_door_bias_enemy_count=1,
+        combat_door_bias_weight=0.15,
+        force_motion_when_ideal=True,
         notes="Commit to persistent LOS/flank goals for obstacle-blocked targets.",
     ),
     8: RoomPlan(
@@ -111,6 +130,10 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         allow_river_door_shortcut=False,
         immediate_threat_spawn_groups={"immediate_threat"},
         obstacle_spawn_groups={"big_cat"},
+        combat_door_bias_enemy_count=2,
+        combat_door_bias_weight=0.25,
+        coin_path_distance=64.0,
+        force_motion_when_ideal=True,
         notes="Sweep left, mid, and far groups before strong door movement; avoid corner chases.",
     ),
     9: RoomPlan(
@@ -122,6 +145,9 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         pre_door_health_threshold=75,
         immediate_threat_spawn_groups={"immediate_threat"},
         obstacle_spawn_groups={"big_cat"},
+        combat_door_bias_enemy_count=2,
+        combat_door_bias_weight=0.15,
+        force_motion_when_ideal=True,
         notes="Preserve HP before the final room; prioritize kamikaze and runner threats.",
     ),
     10: RoomPlan(
@@ -134,6 +160,8 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         immediate_threat_spawn_groups={"immediate_threat", "bottom_threat_group"},
         boss_spawn_groups={"boss_group"},
         kite_loop=[(16, 8), (21, 8), (21, 14), (16, 14)],
+        force_motion_when_ideal=True,
+        survival_mode=True,
         notes="Prioritize open-area kiting and high escape-space firing cells.",
     ),
 }

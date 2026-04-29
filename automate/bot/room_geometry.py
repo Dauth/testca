@@ -245,6 +245,30 @@ class ParsedRoom:
             return None
         return dx / mag, dy / mag
 
+    def path_cost(self, ax: float, ay: float, bx: float, by: float) -> float | None:
+        start = self._nearest_walkable_cell(ax, ay)
+        goal = self._nearest_walkable_cell(bx, by)
+        if start is None or goal is None:
+            return None
+        if start == goal:
+            return 0.0
+
+        q = deque([start])
+        dist: dict[tuple[int, int], float] = {start: 0.0}
+        while q:
+            cell = q.popleft()
+            if cell == goal:
+                return dist[cell] * TILE_SIZE
+
+            for nxt in self._neighbors(cell):
+                if nxt in dist:
+                    continue
+                step = 1.41421356237 if nxt[0] != cell[0] and nxt[1] != cell[1] else 1.0
+                dist[nxt] = dist[cell] + step
+                q.append(nxt)
+
+        return None
+
     def _cell_at(self, x: float, y: float) -> int:
         col = int(x / TILE_SIZE)
         row = int(y / TILE_SIZE)

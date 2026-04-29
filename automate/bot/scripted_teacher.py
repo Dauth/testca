@@ -543,10 +543,24 @@ class ScriptedTeacher:
             default=999.0,
         )
         if IDEAL_FIRE_MIN <= tdist <= IDEAL_FIRE_MAX and nearest_enemy_dist >= MIN_SHOOT_DISTANCE:
+            plan = get_room_plan(world.current_room)
             self.current_goal_cell = None
             door_bias = self.combat_door_bias(world, px, py)
             if door_bias is not None:
                 return self.avoid_trap_move(world, px, py, door_bias[0], door_bias[1])
+            if plan.force_motion_when_ideal:
+                routed = self.route_to_safe_firing_position(
+                    world,
+                    self.geometry.load_room(int(world.current_room or 1)),
+                    px,
+                    py,
+                    float(target["x"]),
+                    float(target["y"]),
+                )
+                if routed is not None:
+                    return self.avoid_trap_move(world, px, py, routed[0], routed[1])
+                strafe = normalize_pair(-ty / tdist, tx / tdist)
+                return self.avoid_trap_move(world, px, py, strafe[0], strafe[1])
             return 0.0, 0.0
 
         if tdist < MIN_SHOOT_DISTANCE or tdist > IDEAL_FIRE_MAX:
@@ -636,7 +650,16 @@ class ScriptedTeacher:
 
         routed = self.route_to_line_of_fire_position(world, room, px, py, tx, ty)
         if routed is not None:
-            return self.avoid_trap_move(world, px, py, routed[0], routed[1])
+            nearest_enemy_dist = min(
+                (
+                    distance(px, py, float(enemy["x"]), float(enemy["y"]))
+                    for enemy in world.enemies.values()
+                ),
+                default=999.0,
+            )
+            if nearest_enemy_dist <= EMERGENCY_SHOOT_DISTANCE:
+                return self.avoid_trap_move(world, px, py, routed[0], routed[1])
+            return normalize_pair(routed[0], routed[1])
 
         if self.blocked_target_ticks >= 12:
             routed_to_target = room.direction_to_reachable_near_point(
@@ -902,6 +925,7 @@ class ScriptedTeacher:
         self.current_goal_cell = best
         self.goal_target_id = target_id
         self.goal_expires_at_tick = self.tick + GOAL_LOCK_TICKS
+        self.goal_reason = "line_of_fire"
         return self._direction_to_cell(room, px, py, best)
 
     def escape_close_threats(
@@ -1075,6 +1099,7 @@ class ScriptedTeacher:
         self.current_goal_cell = best
         self.goal_target_id = target_id
         self.goal_expires_at_tick = self.tick + GOAL_LOCK_TICKS
+        self.goal_reason = "safe_firing"
 
         step = best
         while parent.get(step) is not None and parent[step] != start:
@@ -1158,9 +1183,10 @@ class ScriptedTeacher:
             return False
         room = self.geometry.load_room(int(world.current_room or 1))
         if plan.river_door_requires_no_blocked_cats:
-            if plan.obstacle_spawn_groups:
+            blocking_groups = plan.river_door_blocking_groups or plan.obstacle_spawn_groups
+            if blocking_groups:
                 for enemy in world.enemies.values():
-                    if spawn_group(world.current_room, enemy) in plan.obstacle_spawn_groups:
+                    if spawn_group(world.current_room, enemy) in blocking_groups:
                         return False
             if self.has_solid_blocked_reachable_cat(world, room, px, py):
                 return False

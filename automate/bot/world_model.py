@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 from . import protocol
+from .spawn_catalog import spawn_label
+
+
+@dataclass
+class CoinMemory:
+    pickup_id: int
+    x: float
+    y: float
+    room_id: int
+    source_enemy_id: int | None = None
+    source_spawn_group: str | None = None
+    created_elapsed_ms: int = 0
+    expires_elapsed_ms: int = 0
+    claimed: bool = False
 
 
 @dataclass
@@ -29,6 +44,8 @@ class WorldModel:
     latest_server_ts: int | None = None
     last_state_elapsed_ms: int | None = None
     last_error: str | None = None
+    recent_enemy_deaths: list[dict[str, Any]] = field(default_factory=list)
+    coin_sources: dict[int, CoinMemory] = field(default_factory=dict)
 
     def apply(self, env: dict[str, Any]) -> None:
         typ = env.get("type")
@@ -75,6 +92,7 @@ class WorldModel:
                 for p in data.get("pickups", [])
                 if int(p.get("entity_id", 0)) not in self.dead_entities
             }
+            self._link_coin_sources()
             self.projectiles = {
                 int(p["proj_id"]): p
                 for p in data.get("projectiles", [])
@@ -91,6 +109,19 @@ class WorldModel:
         elif typ == protocol.S2C_ENTITY_DIED:
             entity_id = int(data.get("entity_id", 0))
             if entity_id:
+                enemy = self.enemies.get(entity_id) or self.previous_enemies.get(entity_id)
+                if enemy is not None:
+                    spawn = spawn_label(self.current_room, enemy)
+                    self.recent_enemy_deaths.append(
+                        {
+                            "entity_id": entity_id,
+                            "room_id": self.current_room,
+                            "x": float(enemy.get("x", 0.0) or 0.0),
+                            "y": float(enemy.get("y", 0.0) or 0.0),
+                            "spawn_group": spawn.get("spawn_group"),
+                            "elapsed_ms": self.elapsed_ms,
+                        }
+                    )
                 self.dead_entities.add(entity_id)
                 self.enemies.pop(entity_id, None)
                 self.pickups.pop(entity_id, None)
@@ -117,6 +148,49 @@ class WorldModel:
             int(d["door_id"]) for d in room.get("doors", []) if not d.get("locked", True)
         }
         self.dead_entities = set()
+        self.recent_enemy_deaths = []
+        self.coin_sources = {}
+
+    def _link_coin_sources(self) -> None:
+        room_id = int(self.current_room or 0)
+        self.recent_enemy_deaths = [
+            death
+            for death in self.recent_enemy_deaths
+            if int(death.get("room_id") or 0) == room_id
+            and self.elapsed_ms - int(death.get("elapsed_ms") or 0) <= 30_000
+        ]
+        for pickup_id, pickup in self.pickups.items():
+            if int(pickup.get("type", 0) or 0) != protocol.PICKUP_COIN:
+                continue
+            if pickup_id in self.coin_sources:
+                continue
+            px = float(pickup.get("x", 0.0) or 0.0)
+            py = float(pickup.get("y", 0.0) or 0.0)
+            candidates = [
+                death
+                for death in self.recent_enemy_deaths
+                if math.hypot(float(death.get("x", px) or px) - px, float(death.get("y", py) or py) - py)
+                <= 96.0
+            ]
+            if not candidates:
+                continue
+            death = min(
+                candidates,
+                key=lambda item: math.hypot(
+                    float(item.get("x", px) or px) - px,
+                    float(item.get("y", py) or py) - py,
+                ),
+            )
+            self.coin_sources[pickup_id] = CoinMemory(
+                pickup_id=pickup_id,
+                x=px,
+                y=py,
+                room_id=room_id,
+                source_enemy_id=int(death.get("entity_id") or 0),
+                source_spawn_group=death.get("spawn_group"),
+                created_elapsed_ms=self.elapsed_ms,
+                expires_elapsed_ms=self.elapsed_ms + 30_000,
+            )
 
     def visible_pickup_ids(self) -> list[int]:
         return list(self.pickups.keys())

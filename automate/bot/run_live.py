@@ -9,6 +9,7 @@ import time
 from typing import Iterable
 
 from . import protocol
+from .coin_planner import CoinDecision, CoinPlanner
 from .room_plans import get_room_plan
 from .room_geometry import RoomGeometry
 from .scripted_teacher import ScriptedTeacher
@@ -49,6 +50,7 @@ class LiveBot:
         self.world = WorldModel()
         self.teacher = ScriptedTeacher()
         self.geometry = RoomGeometry(Path(__file__).resolve().parents[2])
+        self.coin_planner = CoinPlanner(self.geometry)
         self.claimed_pickups: set[int] = set()
         self.last_shot_at = 0.0
         self.last_input_log_at = 0.0
@@ -255,6 +257,11 @@ class LiveBot:
                 "reason": "interact_pickup",
                 **self._teacher_debug_fields(None),
             }
+            if pickup_type == protocol.PICKUP_COIN:
+                decision = self._coin_decision(pickup_id, hp, ammo, current_weapon)
+                self.last_action_summary.update(
+                    self._coin_debug_fields(pickup_id, decision, hp, ammo, current_weapon)
+                )
             yield self.proto.interact(pickup_id, pickup_type)
 
         # Shop is a menu/protocol action, unlike physical pickups and doors.
@@ -276,16 +283,18 @@ class LiveBot:
             coin_target = self._priority_coin_target(hp, ammo, current_weapon)
             if coin_target is not None and not self._near_pickup(coin_target):
                 dx, dy = self._pickup_direction(coin_target)
+                decision = self._coin_decision(coin_target, hp, ammo, current_weapon)
                 self.last_action_summary = {
                     "objective_type": "pickup",
                     "objective_id": coin_target,
                     "pickup_id": coin_target,
                     "pickup_type": protocol.PICKUP_COIN,
-                    "pickup_reason": "coin_to_next_shop",
-                    "coin_detour": round(self._coin_detour_cost(coin_target), 1),
+                    "pickup_reason": decision.reason,
+                    "coin_detour": round(decision.detour_px, 1),
                     "coins_needed_for_next_shop": self._coins_needed_for_next_shop_purchase(
                         hp, ammo, current_weapon
                     ),
+                    **self._coin_debug_fields(coin_target, decision, hp, ammo, current_weapon),
                     "physical_interact_allowed": False,
                     "dx": dx,
                     "dy": dy,
@@ -295,8 +304,9 @@ class LiveBot:
                     **self._teacher_debug_fields(None),
                 }
                 self.logger.info(
-                    "move_to_coin id=%s reason=coin_to_next_shop needed=%s detour=%.1f dx=%.3f dy=%.3f",
+                    "move_to_coin id=%s reason=%s needed=%s detour=%.1f dx=%.3f dy=%.3f",
                     coin_target,
+                    decision.reason,
                     self.last_action_summary["coins_needed_for_next_shop"],
                     self.last_action_summary["coin_detour"],
                     dx,
@@ -527,11 +537,16 @@ class LiveBot:
                 return actual_type, "ammo_on_way_safe"
             return None, "skip_ammo_not_needed"
         if actual_type == protocol.PICKUP_COIN:
-            if self.pickup_mode == "on-way" and not self._pickup_on_way(pickup_id):
+            decision = self._coin_decision(pickup_id, hp, ammo, current_weapon)
+            if self.pickup_mode == "on-way" and decision.reason not in {
+                "coin_touching",
+                "coin_on_route",
+                "coin_on_route_shop",
+            }:
                 return None, "coin_off_path"
-            if self._pickup_on_way(pickup_id):
-                return actual_type, "coin_on_way"
-            return None, "coin_not_on_way"
+            if decision.should_pick:
+                return actual_type, decision.reason
+            return None, decision.reason
         return None, "unknown_pickup_type"
 
     def _priority_pickup_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
@@ -650,7 +665,12 @@ class LiveBot:
         path_distance = get_room_plan(self.world.current_room).coin_path_distance
         if path_distance is None:
             path_distance = COIN_PATH_DISTANCE
-        return distance_to_segment(x, y, px, py, objective[0], objective[1]) <= path_distance
+        try:
+            room = self.geometry.load_room(int(self.world.current_room or 1))
+            detour = self.coin_planner.route_detour(room, px, py, x, y, objective[0], objective[1])
+            return detour <= path_distance
+        except Exception:
+            return distance_to_segment(x, y, px, py, objective[0], objective[1]) <= path_distance
 
     def _should_save_shotgun_ammo(self, current_weapon: int, ammo: int) -> bool:
         if current_weapon == WEAPON_SHOTGUN and ammo <= LOW_AMMO_THRESHOLD:
@@ -711,19 +731,31 @@ class LiveBot:
         return purchases
 
     def _priority_coin_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
-        if self.pickup_mode == "remote" or self.world.enemies:
+        if self.pickup_mode == "remote" or hp <= LOW_HEALTH_THRESHOLD:
             return None
         needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
-        if needed <= 0 or needed > COIN_ROUTE_MAX_NEEDED:
+        nearest_enemy = self._nearest_enemy_distance()
+        if self.world.enemies and nearest_enemy < 260.0:
+            return None
+        if needed <= 0 and self.world.enemies:
+            return None
+        if needed > COIN_ROUTE_MAX_NEEDED:
             return None
 
-        candidates = self._coin_route_candidates()
+        candidates = self._coin_route_candidates(hp, ammo, current_weapon)
         if len(candidates) < needed:
             return None
-        target = min(candidates, key=lambda pickup: self._coin_detour_cost(int(pickup["entity_id"])))
+        if not candidates:
+            return None
+        target = max(
+            candidates,
+            key=lambda pickup: self._coin_decision(
+                int(pickup["entity_id"]), hp, ammo, current_weapon
+            ).priority,
+        )
         return int(target["entity_id"])
 
-    def _coin_route_candidates(self) -> list[dict]:
+    def _coin_route_candidates(self, hp: int, ammo: int, current_weapon: int) -> list[dict]:
         candidates: list[dict] = []
         for pickup in self.world.pickups.values():
             if int(pickup.get("type", 0) or 0) != protocol.PICKUP_COIN:
@@ -731,9 +763,8 @@ class LiveBot:
             pickup_id = int(pickup.get("entity_id", 0) or 0)
             if pickup_id in self.claimed_pickups:
                 continue
-            dist = self._pickup_distance(pickup_id)
-            detour = self._coin_detour_cost(pickup_id)
-            if dist <= COIN_ROUTE_NEAR_DISTANCE or detour <= COIN_ROUTE_MAX_DETOUR:
+            decision = self._coin_decision(pickup_id, hp, ammo, current_weapon)
+            if decision.should_pick:
                 candidates.append(pickup)
         return candidates
 
@@ -745,13 +776,56 @@ class LiveBot:
         cx = float(pickup.get("x", px) or px)
         cy = float(pickup.get("y", py) or py)
         objective = self._current_objective_point()
-        direct = 0.0
-        via_coin = math.hypot(cx - px, cy - py)
-        if objective is not None:
-            ox, oy = objective
-            direct = math.hypot(ox - px, oy - py)
-            via_coin += math.hypot(ox - cx, oy - cy)
-        return max(0.0, via_coin - direct)
+        if objective is None:
+            return math.hypot(cx - px, cy - py)
+        try:
+            room = self.geometry.load_room(int(self.world.current_room or 1))
+            return self.coin_planner.route_detour(room, px, py, cx, cy, objective[0], objective[1])
+        except Exception:
+            direct = math.hypot(objective[0] - px, objective[1] - py)
+            via_coin = math.hypot(cx - px, cy - py) + math.hypot(objective[0] - cx, objective[1] - cy)
+            return max(0.0, via_coin - direct)
+
+    def _coin_decision(
+        self, pickup_id: int, hp: int, ammo: int, current_weapon: int
+    ) -> CoinDecision:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        memory = self.world.coin_sources.get(int(pickup_id))
+        source_group = memory.source_spawn_group if memory is not None else None
+        reaches_shop = self._coin_reaches_shop_threshold(hp, ammo, current_weapon)
+        return self.coin_planner.decide_coin(
+            self.world,
+            pickup,
+            self._current_objective_point(),
+            self._nearest_enemy_distance(),
+            reaches_shop,
+            source_group,
+        )
+
+    def _coin_debug_fields(
+        self,
+        pickup_id: int,
+        decision: CoinDecision,
+        hp: int,
+        ammo: int,
+        current_weapon: int,
+    ) -> dict:
+        memory = self.world.coin_sources.get(int(pickup_id))
+        return {
+            "coin_pickup_id": pickup_id,
+            "coin_source_enemy_id": memory.source_enemy_id if memory is not None else None,
+            "coin_source_spawn_group": memory.source_spawn_group if memory is not None else None,
+            "coin_detour_px": round(decision.detour_px, 1),
+            "coin_decision_reason": decision.reason,
+            "coin_reaches_shop_threshold": self._coin_reaches_shop_threshold(
+                hp, ammo, current_weapon
+            ),
+            "nearest_enemy_distance_at_coin_decision": round(self._nearest_enemy_distance(), 1),
+        }
+
+    def _coin_reaches_shop_threshold(self, hp: int, ammo: int, current_weapon: int) -> bool:
+        needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
+        return 1 <= needed <= COIN_ROUTE_MAX_NEEDED
 
     def _coins_needed_for_next_shop_purchase(self, hp: int, ammo: int, current_weapon: int) -> int:
         player = self.world.player or {}
