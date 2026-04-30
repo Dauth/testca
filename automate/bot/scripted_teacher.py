@@ -112,12 +112,26 @@ class ScriptedTeacher:
             self._clear_locks(clear_target=True)
 
         player = world.player
-        if not player or not world.enemies:
+        if not player:
             self._clear_locks(clear_target=True)
             return Action()
 
         px = float(player.get("x", 640.0))
         py = float(player.get("y", 384.0))
+        if not world.enemies:
+            self._clear_locks(clear_target=True)
+            wave_move = self.wave_preposition_direction(world, px, py)
+            if wave_move is not None:
+                self.route_mode = "wave_preposition"
+                self.last_move = wave_move
+                return Action(
+                    dx=wave_move[0],
+                    dy=wave_move[1],
+                    fire=False,
+                    reason="wave_preposition",
+                )
+            return Action()
+
         self._update_stuck(px, py)
         route_target = self.choose_route_target(world, px, py)
         fire_target, fire_los_clear = self.choose_fire_target(world, px, py)

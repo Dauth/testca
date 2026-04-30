@@ -43,7 +43,7 @@ class LiveBot:
         door_enter_distance: float = 48.0,
         pickup_mode: str = "physical",
         pickup_interact_distance: float = PICKUP_INTERACT_DISTANCE,
-        coin_mode: str = "greedy-threshold",
+        coin_mode: str = "greedy-kite",
     ):
         self.url = url
         self.player_id = player_id
@@ -295,60 +295,62 @@ class LiveBot:
                 dx, dy = self._pickup_direction(coin_target)
                 decision = self._coin_decision(coin_target, hp, ammo, current_weapon)
                 action = self.teacher.choose(self.world)
-                self.last_action_summary = {
-                    "objective_type": "coin_kite",
-                    "objective_id": coin_target,
-                    "pickup_id": coin_target,
-                    "pickup_type": protocol.PICKUP_COIN,
-                    "pickup_reason": "greedy_kite_coin",
-                    "coin_detour": round(self._coin_detour_cost(coin_target), 1),
-                    "coins_needed_for_next_shop": self._coins_needed_for_next_shop_purchase(
-                        hp, ammo, current_weapon
-                    ),
-                    **self._coin_debug_fields(coin_target, decision, hp, ammo, current_weapon),
-                    "physical_interact_allowed": False,
-                    "dx": dx,
-                    "dy": dy,
-                    "fire": action.fire,
-                    "target_id": action.target_id,
-                    "los_clear": action.los_clear,
-                    "range_ok": action.range_ok,
-                    "distance_to_target": action.distance_to_target,
-                    "weapon_id": action.weapon_id,
-                    "reason": "move_to_coin_while_shooting",
-                    **self._teacher_debug_fields(action.target_id),
-                }
-                self.logger.info(
-                    "move_to_coin_kite id=%s mode=%s reason=%s needed=%s detour=%.1f dx=%.3f dy=%.3f fire=%s",
-                    coin_target,
-                    self.coin_mode,
-                    self.last_action_summary["coin_decision_reason"],
-                    self.last_action_summary["coins_needed_for_next_shop"],
-                    self.last_action_summary["coin_detour"],
-                    dx,
-                    dy,
-                    action.fire,
-                )
-                if action.fire:
-                    now = time.time()
-                    if now - self.last_shot_at >= 0.2:
-                        self.logger.info(
-                            "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s distance=%.1f los_clear=%s range_ok=%s reason=%s+coin",
-                            action.target_id,
-                            action.weapon_id or current_weapon,
-                            action.aim_angle,
-                            len(self.world.enemies),
-                            action.distance_to_target,
-                            action.los_clear,
-                            action.range_ok,
-                            action.reason,
-                        )
-                        self.last_shot_at = now
-                    for msg in self._shoot_messages(action, current_weapon):
-                        yield msg
-                yield self.proto.input(dx, dy)
-                return
-
+                if self.world.enemies and not action.fire:
+                    coin_target = None
+                else:
+                    self.last_action_summary = {
+                        "objective_type": "coin_kite",
+                        "objective_id": coin_target,
+                        "pickup_id": coin_target,
+                        "pickup_type": protocol.PICKUP_COIN,
+                        "pickup_reason": "greedy_kite_coin",
+                        "coin_detour": round(self._coin_detour_cost(coin_target), 1),
+                        "coins_needed_for_next_shop": self._coins_needed_for_next_shop_purchase(
+                            hp, ammo, current_weapon
+                        ),
+                        **self._coin_debug_fields(coin_target, decision, hp, ammo, current_weapon),
+                        "physical_interact_allowed": False,
+                        "dx": dx,
+                        "dy": dy,
+                        "fire": action.fire,
+                        "target_id": action.target_id,
+                        "los_clear": action.los_clear,
+                        "range_ok": action.range_ok,
+                        "distance_to_target": action.distance_to_target,
+                        "weapon_id": action.weapon_id,
+                        "reason": "move_to_coin_while_shooting",
+                        **self._teacher_debug_fields(action.target_id),
+                    }
+                    self.logger.info(
+                        "move_to_coin_kite id=%s mode=%s reason=%s needed=%s detour=%.1f dx=%.3f dy=%.3f fire=%s",
+                        coin_target,
+                        self.coin_mode,
+                        self.last_action_summary["coin_decision_reason"],
+                        self.last_action_summary["coins_needed_for_next_shop"],
+                        self.last_action_summary["coin_detour"],
+                        dx,
+                        dy,
+                        action.fire,
+                    )
+                    if action.fire:
+                        now = time.time()
+                        if now - self.last_shot_at >= 0.2:
+                            self.logger.info(
+                                "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s distance=%.1f los_clear=%s range_ok=%s reason=%s+coin",
+                                action.target_id,
+                                action.weapon_id or current_weapon,
+                                action.aim_angle,
+                                len(self.world.enemies),
+                                action.distance_to_target,
+                                action.los_clear,
+                                action.range_ok,
+                                action.reason,
+                            )
+                            self.last_shot_at = now
+                        for msg in self._shoot_messages(action, current_weapon):
+                            yield msg
+                    yield self.proto.input(dx, dy)
+                    return
             coin_target = self._priority_coin_target(hp, ammo, current_weapon)
             if coin_target is not None and not self._near_pickup(coin_target):
                 dx, dy = self._pickup_direction(coin_target)
@@ -486,7 +488,18 @@ class LiveBot:
                         self.world.current_room,
                     )
                 self.last_los_log_at = now
-        dx, dy = normalize(action.dx, action.dy)
+        raw_dx, raw_dy = normalize(action.dx, action.dy)
+        dx, dy, aim_stabilized, movement_scale = self._stabilize_input_while_firing(raw_dx, raw_dy, action)
+        self.last_action_summary.update(
+            {
+                "raw_dx": raw_dx,
+                "raw_dy": raw_dy,
+                "aim_stabilized": aim_stabilized,
+                "movement_scale": movement_scale,
+                "dx": dx,
+                "dy": dy,
+            }
+        )
         now = time.time()
         if now - self.last_input_log_at >= 1.0:
             self.logger.info("movement input dx=%.3f dy=%.3f", dx, dy)
@@ -1015,10 +1028,10 @@ class LiveBot:
         elif room >= 9 and (no_enemies or room == 10 or limited_ammo_low):
             buy_ammo_once()
 
-        while speed < 2 and buy(protocol.SHOP_SPEED, 10):
+        while speed < 1 and buy(protocol.SHOP_SPEED, 10):
             speed += 1
 
-        while fire_rate < 4 and buy(protocol.SHOP_FIRE_RATE, 15):
+        while fire_rate < 3 and buy(protocol.SHOP_FIRE_RATE, 15):
             fire_rate += 1
 
         if room >= 8 and (no_enemies or room == 10 or limited_ammo_low):
@@ -1026,6 +1039,15 @@ class LiveBot:
 
         # Do not drain 10-coin chunks on extra speed while we are still saving
         # for the first real DPS upgrades.
+        if fire_rate < 3:
+            return purchases
+
+        while speed < 2 and buy(protocol.SHOP_SPEED, 10):
+            speed += 1
+
+        while fire_rate < 4 and buy(protocol.SHOP_FIRE_RATE, 15):
+            fire_rate += 1
+
         if fire_rate < 4:
             return purchases
 
@@ -1180,11 +1202,13 @@ class LiveBot:
         if room_id == 10:
             max_detour = 32.0
         elif self.world.enemies:
-            max_detour = 260.0 if reaches_shop else 80.0
+            max_detour = 140.0 if reaches_shop else 48.0
         else:
             max_detour = 340.0 if reaches_shop else 140.0
             if room_id >= 8 and reaches_shop:
                 max_detour = 420.0
+        if self.world.enemies and not reaches_shop and pickup_distance > COIN_ROUTE_NEAR_DISTANCE:
+            return None
         if detour > max_detour:
             return None
 
@@ -1342,12 +1366,16 @@ class LiveBot:
         no_enemies = not self.world.enemies
         limited_ammo_low = self._limited_ammo_low_for_final(ammo, current_weapon)
 
+        if speed < 1 and coins < 10:
+            return 10 - coins
+        if fire_rate < 3 and coins < 15:
+            return 15 - coins
+        if room >= 8 and room not in self.ammo_shop_rooms and limited_ammo_low and coins < 5:
+            return 5 - coins
         if speed < 2 and coins < 10:
             return 10 - coins
         if fire_rate < 4 and coins < 15:
             return 15 - coins
-        if room >= 8 and room not in self.ammo_shop_rooms and limited_ammo_low and coins < 5:
-            return 5 - coins
         if fire_rate < 5 and coins < 15:
             return 15 - coins
         if speed < 3 and coins < 10:
@@ -1370,12 +1398,16 @@ class LiveBot:
         no_enemies = not self.world.enemies
         limited_ammo_low = self._limited_ammo_low_for_final(ammo, current_weapon)
 
+        if speed < 1 and coins < 10:
+            return "speed_1"
+        if fire_rate < 3 and coins < 15:
+            return "fire_rate_3"
+        if room >= 8 and room not in self.ammo_shop_rooms and limited_ammo_low and coins < 5:
+            return "ammo_final"
         if speed < 2 and coins < 10:
             return "speed_2"
         if fire_rate < 4 and coins < 15:
             return "fire_rate_4"
-        if room >= 8 and room not in self.ammo_shop_rooms and limited_ammo_low and coins < 5:
-            return "ammo_final"
         if fire_rate < 5 and coins < 15:
             return "fire_rate_5"
         if speed < 3 and coins < 10:
@@ -1414,6 +1446,20 @@ class LiveBot:
             math.hypot(float(enemy.get("x", px) or px) - px, float(enemy.get("y", py) or py) - py)
             for enemy in self.world.enemies.values()
         )
+
+    def _stabilize_input_while_firing(self, dx: float, dy: float, action) -> tuple[float, float, bool, float]:
+        if not action.fire:
+            return dx, dy, False, 1.0
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return dx, dy, False, 1.0
+        nearest_enemy = self._nearest_enemy_distance()
+        if nearest_enemy < 160.0 or action.reason == "emergency_close_threat":
+            return dx, dy, False, 1.0
+        if action.distance_to_target < 220.0:
+            scale = 0.75
+        else:
+            scale = 0.55
+        return dx * scale, dy * scale, True, scale
 
     def _has_big_cat_alive(self) -> bool:
         return any(
@@ -1620,7 +1666,7 @@ def main() -> None:
     parser.add_argument(
         "--coin-mode",
         choices=("cautious", "greedy-kite", "greedy-threshold"),
-        default="greedy-threshold",
+        default="greedy-kite",
     )
     args = parser.parse_args()
     logging.basicConfig(
