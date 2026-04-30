@@ -8,7 +8,7 @@ from typing import Any
 
 from .room_plans import RoomPlan, get_room_plan
 from .room_geometry import RoomGeometry
-from .spawn_catalog import spawn_group, spawn_groups
+from .spawn_catalog import ROOM_SPAWNS, spawn_group, spawn_groups
 from .world_model import WorldModel
 
 
@@ -30,7 +30,7 @@ ROOM10_SHOTGUN_MAX = 205.0
 ROOM10_RIFLE_MIN = 240.0
 ROOM10_RIFLE_MAX = 420.0
 TARGET_SWITCH_ADVANTAGE = 64.0
-DOOR_TARGET_SWITCH_ADVANTAGE = 96.0
+DOOR_TARGET_SWITCH_ADVANTAGE = 32.0
 RIVER_DOOR_CLOSE_DISTANCE = 520.0
 GOAL_REACHED_DISTANCE = 24.0
 GOAL_LOCK_TICKS = 18
@@ -279,7 +279,7 @@ class ScriptedTeacher:
             if door is not None and int(preferred["entity_id"]) != self.route_target_id:
                 door_advantage = (
                     distance(float(preferred["x"]), float(preferred["y"]), door[0], door[1])
-                    >= distance(float(locked["x"]), float(locked["y"]), door[0], door[1])
+                    > distance(float(locked["x"]), float(locked["y"]), door[0], door[1])
                     + DOOR_TARGET_SWITCH_ADVANTAGE
                 )
             blocked_too_long = (
@@ -385,7 +385,7 @@ class ScriptedTeacher:
                 self.route_mode = "spawn_flank_required"
                 return blocked_flank_group
 
-        if visible_enemies:
+        if visible_enemies and not plan.clear_far_from_door_first:
             self.route_mode = "visible_sweep"
             return visible_enemies
 
@@ -631,6 +631,9 @@ class ScriptedTeacher:
         if IDEAL_FIRE_MIN <= tdist <= IDEAL_FIRE_MAX and nearest_enemy_dist >= MIN_SHOOT_DISTANCE:
             plan = get_room_plan(world.current_room)
             self.current_goal_cell = None
+            wave_stage = self.next_wave_staging_direction(world, px, py)
+            if wave_stage is not None:
+                return self.avoid_trap_move(world, px, py, wave_stage[0], wave_stage[1])
             door_bias = self.combat_door_bias(world, px, py)
             if door_bias is not None:
                 return self.avoid_trap_move(world, px, py, door_bias[0], door_bias[1])
@@ -690,10 +693,87 @@ class ScriptedTeacher:
             vx += door_bias[0] * plan.combat_door_bias_weight
             vy += door_bias[1] * plan.combat_door_bias_weight
 
+        wave_stage = self.next_wave_staging_direction(world, px, py)
+        if wave_stage is not None:
+            vx += wave_stage[0] * 0.9
+            vy += wave_stage[1] * 0.9
+
         mag = math.hypot(vx, vy)
         if mag < 1e-6:
             return 0.0, 0.0
         return self.avoid_trap_move(world, px, py, vx / mag, vy / mag)
+
+    def next_wave_staging_direction(
+        self, world: WorldModel, px: float, py: float
+    ) -> tuple[float, float] | None:
+        room_id = int(world.current_room or 0)
+        if room_id < 4 or room_id == 10 or len(world.enemies) > 2:
+            return None
+        if not world.enemies:
+            return None
+        nearest_enemy_dist = min(
+            distance(px, py, float(enemy["x"]), float(enemy["y"]))
+            for enemy in world.enemies.values()
+        )
+        if nearest_enemy_dist < MIN_SHOOT_DISTANCE:
+            return None
+        phase = self.next_unseen_wave_phase(world)
+        if phase is None:
+            return None
+        door = self.known_door_point(world)
+        spawns = [spawn for spawn in ROOM_SPAWNS.get(room_id, []) if spawn.phase == phase]
+        if not spawns:
+            return None
+        if door is not None:
+            target_spawn = max(
+                spawns,
+                key=lambda spawn: (
+                    distance(spawn.x, spawn.y, door[0], door[1]),
+                    -distance(px, py, spawn.x, spawn.y),
+                ),
+            )
+        else:
+            target_spawn = min(spawns, key=lambda spawn: distance(px, py, spawn.x, spawn.y))
+        room = self.geometry.load_room(room_id)
+        routed = room.direction_to_reachable_near_point(px, py, target_spawn.x, target_spawn.y, 96.0)
+        if routed is None:
+            routed = room.direction_to_point(px, py, target_spawn.x, target_spawn.y)
+        if routed is None:
+            return None
+        self.macro_waypoint = (
+            int(max(0, min(39, target_spawn.x // TILE_SIZE))),
+            int(max(0, min(23, target_spawn.y // TILE_SIZE))),
+        )
+        return normalize_pair(*routed)
+
+    def next_unseen_wave_phase(self, world: WorldModel) -> str | None:
+        room_id = int(world.current_room or 0)
+        phases = sorted(
+            {
+                spawn.phase
+                for spawn in ROOM_SPAWNS.get(room_id, [])
+                if spawn.phase.startswith("wave")
+            }
+        )
+        if not phases:
+            return None
+        seen_entity_ids = set(world.enemies) | set(world.dead_entities)
+        for phase in phases:
+            ids = self.spawn_entity_ids_for_phase(room_id, phase)
+            if ids and not seen_entity_ids.intersection(ids):
+                return phase
+        return None
+
+    def spawn_entity_ids_for_phase(self, room_id: int, phase: str) -> set[int]:
+        ids: set[int] = set()
+        wave_idx = 0
+        for spawn in ROOM_SPAWNS.get(room_id, []):
+            if spawn.phase.startswith("wave"):
+                entity_id = 100000 + room_id * 1000 + wave_idx
+                if spawn.phase == phase:
+                    ids.add(entity_id)
+                wave_idx += 1
+        return ids
 
     def only_big_cats_remain(self, world: WorldModel) -> bool:
         return bool(world.enemies) and all(

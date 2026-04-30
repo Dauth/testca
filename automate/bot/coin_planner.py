@@ -80,7 +80,9 @@ class CoinPlanner:
         if nearest_enemy_distance < 260.0:
             return 96.0 if reaches_shop_threshold else 32.0
         if not world.enemies:
-            return 224.0 if reaches_shop_threshold else 96.0
+            if reaches_shop_threshold and int(world.current_room or 1) >= 8:
+                return 420.0
+            return 320.0 if reaches_shop_threshold else 96.0
         return 224.0 if reaches_shop_threshold else 64.0
 
     def route_detour(

@@ -21,7 +21,7 @@ Files:
 - `bot/scripted_teacher.py`: deterministic combat policy with room geometry, line-of-fire checks, five-tile spacing preference, and lead aiming.
 - `bot/room_plans.py`: per-room macro playbooks layered over the generic physical planner for fixed-map strategy such as room 5 river/obstacle ordering, room 7 blocked-cat flanking, and room 10 survival kiting.
 - `bot/spawn_catalog.py`: base spawn zones for rooms 1-10, plus spawn-label matching for room-specific strategy and JSONL debugging.
-- `bot/run_live.py`: live websocket bot loop with pickup claiming, shop automation, visible door walking, and JSONL recording.
+- `bot/run_live.py`: live websocket bot loop with pickup claiming, shop automation, visible door walking, and JSONL gameplay recording.
 - `bot/seed_search.py`: seed ranking scaffold for legal start-time windows.
 - `training/policy_model.py`: compact PyTorch policy outline.
 - `training/train_bc.py`: behavior cloning outline.
@@ -39,6 +39,8 @@ automate/.venv/bin/python -B -m automate.bot.run_live --url ws://localhost:8080/
 ```
 
 For visual live review, open `http://localhost:5173/spectate/bot-local` before starting the bot. The root `http://localhost:5173` page does not attach to the bot spectator.
+
+Each live run writes a JSONL gameplay log under `automate/logs/` by default. Every file includes received game states plus each chosen action, movement vector, shot decision, route/fire targets, room plan name, LOS state, goal cell, spawn labels, and pickup/shop/door logic. Use `--log-dir PATH` to write those logs somewhere else.
 
 Door walking is now the default so the browser view shows the bot physically moving to the unlocked door. Use `--no-walk-to-door` to test the faster protocol shortcut. Pickup mode defaults to `physical`; use `--pickup-mode remote` only for exploit/speedrun testing. `--pickup-mode on-way` keeps physical interaction but limits coin pickup claims to nearby/path pickups while still allowing low-health recovery. Room plans can also delay a door transition for health, for example before room 10 when a health pickup is available.
 

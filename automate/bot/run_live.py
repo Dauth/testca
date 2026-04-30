@@ -36,7 +36,7 @@ class LiveBot:
         self,
         url: str,
         player_id: str,
-        log_dir: str = "automate/runs",
+        log_dir: str = "automate/logs",
         stop_room: int = 0,
         start_room: int = 0,
         walk_to_door: bool = True,
@@ -769,22 +769,25 @@ class LiveBot:
         while speed < 2 and buy(protocol.SHOP_SPEED, 10):
             speed += 1
 
-        while fire_rate < 5 and buy(protocol.SHOP_FIRE_RATE, 15):
+        while fire_rate < 4 and buy(protocol.SHOP_FIRE_RATE, 15):
             fire_rate += 1
 
-        if room >= 9 and (no_enemies or room == 10 or limited_ammo_low):
+        if room >= 8 and (no_enemies or room == 10 or limited_ammo_low):
             buy_ammo_once()
 
         # Do not drain 10-coin chunks on extra speed while we are still saving
         # for the first real DPS upgrades.
-        if fire_rate < 3:
+        if fire_rate < 4:
+            return purchases
+
+        while fire_rate < 5 and buy(protocol.SHOP_FIRE_RATE, 15):
+            fire_rate += 1
+
+        if fire_rate < 5:
             return purchases
 
         while speed < 3 and buy(protocol.SHOP_SPEED, 10):
             speed += 1
-
-        if fire_rate < 5:
-            return purchases
 
         while speed < 4 and buy(protocol.SHOP_SPEED, 10):
             speed += 1
@@ -803,7 +806,7 @@ class LiveBot:
         if self.world.enemies:
             return None
         room = int(self.world.current_room or 1)
-        if room < 9 or room == 10:
+        if room == 10:
             return None
         needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
         nearest_enemy = self._nearest_enemy_distance()
@@ -811,7 +814,7 @@ class LiveBot:
             return None
         if needed <= 0:
             return None
-        if needed > COIN_ROUTE_MAX_NEEDED:
+        if needed > self._coin_route_max_needed(hp, ammo, current_weapon):
             return None
 
         candidates = self._coin_route_candidates(hp, ammo, current_weapon)
@@ -827,7 +830,9 @@ class LiveBot:
         )
         if self._pickup_distance(int(target["entity_id"])) > COIN_ROUTE_NEAR_DISTANCE:
             return None
-        if self._coin_detour_cost(int(target["entity_id"])) > COIN_ROUTE_MAX_DETOUR:
+        if self._coin_detour_cost(int(target["entity_id"])) > self._coin_route_max_detour(
+            hp, ammo, current_weapon
+        ):
             return None
         return int(target["entity_id"])
 
@@ -901,7 +906,27 @@ class LiveBot:
 
     def _coin_reaches_shop_threshold(self, hp: int, ammo: int, current_weapon: int) -> bool:
         needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
-        return 1 <= needed <= COIN_ROUTE_MAX_NEEDED
+        return 1 <= needed <= self._coin_route_max_needed(hp, ammo, current_weapon)
+
+    def _coin_route_max_needed(self, hp: int, ammo: int, current_weapon: int) -> int:
+        if self.world.enemies:
+            return 2
+        if int(self.world.current_room or 1) >= 8:
+            return 6
+        return 4
+
+    def _coin_route_max_detour(self, hp: int, ammo: int, current_weapon: int) -> float:
+        room = int(self.world.current_room or 1)
+        if room == 10:
+            return 32.0
+        threshold = self._coin_reaches_shop_threshold(hp, ammo, current_weapon)
+        if self.world.enemies:
+            return 96.0 if threshold else 64.0
+        if room >= 8 and threshold:
+            return 420.0
+        if threshold:
+            return 320.0
+        return 96.0
 
     def _coins_needed_for_next_shop_purchase(self, hp: int, ammo: int, current_weapon: int) -> int:
         player = self.world.player or {}
@@ -913,16 +938,16 @@ class LiveBot:
         no_enemies = not self.world.enemies
         limited_ammo_low = self._limited_ammo_low_for_final(ammo, current_weapon)
 
-        if room >= 9 and room not in self.ammo_shop_rooms and coins < 5:
-            return 5 - coins
         if speed < 2 and coins < 10:
             return 10 - coins
-        if fire_rate < 3 and coins < 15:
+        if fire_rate < 4 and coins < 15:
+            return 15 - coins
+        if room >= 8 and room not in self.ammo_shop_rooms and limited_ammo_low and coins < 5:
+            return 5 - coins
+        if fire_rate < 5 and coins < 15:
             return 15 - coins
         if speed < 3 and coins < 10:
             return 10 - coins
-        if fire_rate < 5 and coins < 15:
-            return 15 - coins
         if speed < 4 and coins < 10:
             return 10 - coins
         if self._next_damage_stack_useful(damage) and coins < 20:
@@ -1142,7 +1167,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8080/ws")
     parser.add_argument("--player-id", default="bot-local")
-    parser.add_argument("--log-dir", default="automate/runs")
+    parser.add_argument("--log-dir", default="automate/logs")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--stop-room", type=int, default=0)
     parser.add_argument("--start-room", type=int, default=0)
