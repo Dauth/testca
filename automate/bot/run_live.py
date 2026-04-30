@@ -1084,8 +1084,11 @@ class LiveBot:
             "route_mode": self.teacher.route_mode,
             "stuck_ticks": self.teacher.stuck_ticks,
             "failed_goal_count": sum(len(cells) for cells in self.teacher.failed_goal_cells.values()),
+            "macro_waypoint": self.teacher.macro_waypoint,
             "fire_target_spawn_label": fire_spawn.get("spawn_label"),
+            "fire_target_spawn_group": fire_spawn.get("spawn_group"),
             "route_target_spawn_label": route_spawn.get("spawn_label"),
+            "route_target_spawn_group": route_spawn.get("spawn_group"),
             "target_spawn_label": target_spawn.get("spawn_label"),
             "target_spawn_group": target_spawn.get("spawn_group"),
             "spawn_phase": target_spawn.get("spawn_phase"),
@@ -1098,6 +1101,7 @@ class LiveBot:
                 self.world.current_room == 10 and self.teacher.only_big_cats_remain(self.world)
             ),
             "pre_door_health_active": self._should_collect_pre_door_health(hp),
+            "door_bias_allowed": self.teacher.combat_door_bias(self.world, px, py) is not None,
         }
 
 

@@ -191,6 +191,30 @@ def _build_entity_spawn_index() -> dict[int, SpawnPoint]:
 ENTITY_SPAWN_BY_ID = _build_entity_spawn_index()
 
 
+EXTRA_SPAWN_GROUPS: dict[int, dict[str, set[str]]] = {
+    8: {
+        "upper_left_runner": {"upper_wave"},
+        "upper_mid_runner": {"upper_wave"},
+        "upper_tank": {"upper_wave"},
+        "upper_left_grunt": {"upper_wave"},
+        "upper_right_grunt": {"right_wave"},
+        "right_kamikaze": {"right_wave"},
+        "mid_right_grunt": {"right_wave"},
+    },
+    9: {
+        "upper_left_grunt": {"upper_left_wave"},
+        "upper_left_runner": {"upper_left_wave"},
+        "upper_left_runner_2": {"upper_left_wave"},
+        "upper_runner": {"upper_mid_wave"},
+        "upper_mid_kamikaze": {"upper_mid_wave"},
+        "upper_mid_kamikaze_2": {"upper_mid_wave"},
+        "upper_right_tank": {"upper_right_wave"},
+        "upper_right_grunt": {"upper_right_wave"},
+        "far_upper_right_grunt": {"upper_right_wave"},
+    },
+}
+
+
 def spawn_match_tolerance(spawn: SpawnPoint) -> float:
     return 140.0 if spawn.phase.startswith("wave") else 110.0
 
@@ -236,6 +260,16 @@ def match_enemy_to_spawn(
 def spawn_group(room_id: int | None, enemy: dict[str, Any]) -> str:
     spawn, _ = match_enemy_to_spawn(room_id, enemy)
     return spawn.group if spawn is not None else ""
+
+
+def spawn_groups(room_id: int | None, enemy: dict[str, Any]) -> set[str]:
+    spawn, _ = match_enemy_to_spawn(room_id, enemy)
+    if spawn is None:
+        return set()
+    groups = set(EXTRA_SPAWN_GROUPS.get(int(room_id or 0), {}).get(spawn.label, set()))
+    if spawn.group:
+        groups.add(spawn.group)
+    return groups
 
 
 def spawn_label(room_id: int | None, enemy: dict[str, Any] | None) -> dict[str, Any]:

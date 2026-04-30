@@ -8,7 +8,7 @@ from typing import Any
 
 from .room_plans import RoomPlan, get_room_plan
 from .room_geometry import RoomGeometry
-from .spawn_catalog import spawn_group
+from .spawn_catalog import spawn_group, spawn_groups
 from .world_model import WorldModel
 
 
@@ -94,6 +94,7 @@ class ScriptedTeacher:
         self.goal_expires_at_tick = 0
         self.goal_reason = ""
         self.route_mode = ""
+        self.macro_waypoint: tuple[int, int] | None = None
         self.failed_goal_cells: dict[int, set[tuple[int, int]]] = {}
         self.empty_weapons: set[int] = set()
         self.last_move: tuple[float, float] = (0.0, 0.0)
@@ -313,11 +314,19 @@ class ScriptedTeacher:
             if room.line_of_fire_clear(px, py, float(enemy["x"]), float(enemy["y"]))
         ]
         room_id = int(world.current_room or 1)
+        for group in plan.target_groups_order:
+            group_enemies = [
+                enemy for enemy in enemies if self.enemy_in_group(world, enemy, group)
+            ]
+            if group_enemies:
+                self.route_mode = f"group_{group}"
+                return group_enemies
+
         if plan.immediate_threat_spawn_groups:
             immediate = [
                 enemy
                 for enemy in enemies
-                if spawn_group(world.current_room, enemy) in plan.immediate_threat_spawn_groups
+                if self.enemy_in_any_group(world, enemy, plan.immediate_threat_spawn_groups)
             ]
             if immediate:
                 visible_immediate = [
@@ -343,7 +352,7 @@ class ScriptedTeacher:
             obstacle_group = [
                 enemy
                 for enemy in enemies
-                if spawn_group(world.current_room, enemy) in plan.obstacle_spawn_groups
+                if self.enemy_in_any_group(world, enemy, plan.obstacle_spawn_groups)
             ]
             blocked_obstacle_group = [
                 enemy
@@ -365,7 +374,7 @@ class ScriptedTeacher:
             flank_group = [
                 enemy
                 for enemy in enemies
-                if spawn_group(world.current_room, enemy) in plan.flank_spawn_groups
+                if self.enemy_in_any_group(world, enemy, plan.flank_spawn_groups)
             ]
             blocked_flank_group = [
                 enemy
@@ -739,6 +748,11 @@ class ScriptedTeacher:
         plan = get_room_plan(world.current_room)
         if plan.combat_door_bias_enemy_count is None or plan.combat_door_bias_weight <= 0.0:
             return None
+        if plan.door_bias_blocked_until_groups_clear and any(
+            self.enemy_in_any_group(world, enemy, plan.door_bias_blocked_until_groups_clear)
+            for enemy in world.enemies.values()
+        ):
+            return None
         if not world.enemies or len(world.enemies) > plan.combat_door_bias_enemy_count:
             return None
         door = self.known_door_point(world)
@@ -775,6 +789,10 @@ class ScriptedTeacher:
             self.blocked_target_ticks = 1
 
         tdist = distance(px, py, tx, ty)
+        macro = self.route_to_macro_goal_position(world, room, px, py, target)
+        if macro is not None:
+            return self.avoid_trap_move(world, px, py, macro[0], macro[1])
+
         if self.blocked_target_ticks >= 8 and tdist <= IDEAL_FIRE_MIN:
             routed = self.run_past_blocked_target(world, room, px, py, tx, ty)
             if routed is not None:
@@ -901,6 +919,71 @@ class ScriptedTeacher:
             if routed is not None:
                 return normalize_pair(*routed)
         return None
+
+    def route_to_macro_goal_position(
+        self,
+        world: WorldModel,
+        room: Any,
+        px: float,
+        py: float,
+        target: dict[str, Any],
+    ) -> tuple[float, float] | None:
+        plan = get_room_plan(world.current_room)
+        target_id = int(target.get("entity_id", 0) or 0)
+        failed = self.failed_goal_cells.get(target_id, set())
+        target_groups = spawn_groups(world.current_room, target)
+
+        macro_cells: list[tuple[int, int]] = []
+        for group in target_groups:
+            macro_cells.extend(plan.flank_goals.get(group, []))
+
+        if not macro_cells:
+            return None
+
+        if (
+            self.current_goal_cell is not None
+            and self.goal_target_id == target_id
+            and self.current_goal_cell not in failed
+            and self.current_goal_cell in macro_cells
+            and self.stuck_ticks < STUCK_TICKS_FOR_REPLAN
+        ):
+            gx, gy = room._cell_center(self.current_goal_cell)
+            if distance(px, py, gx, gy) > GOAL_REACHED_DISTANCE:
+                routed = self._direction_to_cell(room, px, py, self.current_goal_cell)
+                if routed is not None:
+                    return routed
+
+        best: tuple[int, int] | None = None
+        best_score = float("-inf")
+        tx = float(target["x"])
+        ty = float(target["y"])
+        for cell in macro_cells:
+            if cell in failed:
+                continue
+            if not room._walkable_cell(cell):
+                continue
+            routed = self._direction_to_cell(room, px, py, cell)
+            if routed is None:
+                continue
+            cx, cy = room._cell_center(cell)
+            score = -distance(px, py, cx, cy) * 0.25
+            if room.line_of_fire_clear(cx, cy, tx, ty):
+                score += 1200.0
+            score -= abs(distance(cx, cy, tx, ty) - PREFERRED_FIRE_DISTANCE) * 1.2
+            score += room.escape_space(cell) * 80.0
+            score -= self.wall_pressure(room, cx, cy) * 80.0
+            if score > best_score:
+                best_score = score
+                best = cell
+
+        if best is None:
+            return None
+        self.current_goal_cell = best
+        self.goal_target_id = target_id
+        self.goal_expires_at_tick = self.tick + GOAL_LOCK_TICKS
+        self.goal_reason = "macro_goal"
+        self.macro_waypoint = best
+        return self._direction_to_cell(room, px, py, best)
 
     def avoid_trap_move(
         self, world: WorldModel, px: float, py: float, dx: float, dy: float
@@ -1572,6 +1655,7 @@ class ScriptedTeacher:
         self.goal_expires_at_tick = 0
         self.goal_reason = ""
         self.route_mode = ""
+        self.macro_waypoint = None
         self.blocked_target_id = None
         self.blocked_target_ticks = 0
         if clear_target:
@@ -1582,6 +1666,14 @@ class ScriptedTeacher:
             return None
         door = min(world.doors.values(), key=lambda d: int(d.get("door_id", 0) or 0))
         return float(door.get("x", 0.0) or 0.0), float(door.get("y", 0.0) or 0.0)
+
+    def enemy_in_group(self, world: WorldModel, enemy: dict[str, Any], group: str) -> bool:
+        return group in spawn_groups(world.current_room, enemy)
+
+    def enemy_in_any_group(
+        self, world: WorldModel, enemy: dict[str, Any], groups: set[str]
+    ) -> bool:
+        return bool(spawn_groups(world.current_room, enemy).intersection(groups))
 
     def wall_pressure(self, room: Any, x: float, y: float) -> float:
         pressure = 0.0

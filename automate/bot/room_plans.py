@@ -24,6 +24,9 @@ class RoomPlan:
     coin_path_distance: float | None = None
     pre_door_health_threshold: int | None = None
     force_motion_when_ideal: bool = False
+    failed_goal_blacklist: bool = False
+    target_groups_order: list[str] = field(default_factory=list)
+    door_bias_blocked_until_groups_clear: set[str] = field(default_factory=set)
     survival_mode: bool = False
     notes: str = ""
 
