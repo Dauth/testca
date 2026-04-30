@@ -849,6 +849,7 @@ class LiveBot:
             not self.world.enemies
             and current_weapon in (2, 3)
             and ammo <= LOW_AMMO_THRESHOLD
+            and self.world.best_unlocked_door() is not None
         ):
             wanted_type = protocol.PICKUP_AMMO
         if wanted_type is None or self.pickup_mode == "remote":

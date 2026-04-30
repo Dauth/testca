@@ -35,6 +35,12 @@ SHOP_SPEED = 2
 SHOP_FIRE_RATE = 3
 SHOP_DAMAGE = 4
 
+# The Go server accepts client timestamps within a small window. In WSL/Windows
+# live runs the local clock can drift behind the server by a couple seconds over
+# long tests, so send slightly future-biased packet timestamps while still
+# remaining well inside the server's accepted window.
+CLIENT_TS_LEAD_MS = 750
+
 
 @dataclass
 class ClientProtocol:
@@ -43,7 +49,7 @@ class ClientProtocol:
     logger: logging.Logger | None = None
 
     def now_ms(self) -> int:
-        return int(time.time() * 1000) + self.server_offset_ms
+        return int(time.time() * 1000) + self.server_offset_ms + CLIENT_TS_LEAD_MS
 
     def observe_server_ts(self, server_ts: int | None) -> None:
         if isinstance(server_ts, int) and server_ts > 0:
