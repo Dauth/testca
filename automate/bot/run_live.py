@@ -43,6 +43,7 @@ class LiveBot:
         door_enter_distance: float = 48.0,
         pickup_mode: str = "physical",
         pickup_interact_distance: float = PICKUP_INTERACT_DISTANCE,
+        coin_mode: str = "greedy-threshold",
     ):
         self.url = url
         self.player_id = player_id
@@ -65,6 +66,8 @@ class LiveBot:
         self.door_enter_distance = door_enter_distance
         self.pickup_mode = pickup_mode
         self.pickup_interact_distance = pickup_interact_distance
+        self.coin_mode = coin_mode
+        self.coin_score_debug: dict[int, dict] = {}
         self.stop_requested = False
         self.record_path = self._make_record_path(log_dir)
         self.record_file = self.record_path.open("a", encoding="utf-8")
@@ -287,10 +290,70 @@ class LiveBot:
                 yield self.proto.shop_purchase(item_id)
 
         if not shop_purchases:
+            coin_target = self._greedy_kite_coin_target(hp, ammo, current_weapon)
+            if coin_target is not None and not self._near_pickup(coin_target):
+                dx, dy = self._pickup_direction(coin_target)
+                decision = self._coin_decision(coin_target, hp, ammo, current_weapon)
+                action = self.teacher.choose(self.world)
+                self.last_action_summary = {
+                    "objective_type": "coin_kite",
+                    "objective_id": coin_target,
+                    "pickup_id": coin_target,
+                    "pickup_type": protocol.PICKUP_COIN,
+                    "pickup_reason": "greedy_kite_coin",
+                    "coin_detour": round(self._coin_detour_cost(coin_target), 1),
+                    "coins_needed_for_next_shop": self._coins_needed_for_next_shop_purchase(
+                        hp, ammo, current_weapon
+                    ),
+                    **self._coin_debug_fields(coin_target, decision, hp, ammo, current_weapon),
+                    "physical_interact_allowed": False,
+                    "dx": dx,
+                    "dy": dy,
+                    "fire": action.fire,
+                    "target_id": action.target_id,
+                    "los_clear": action.los_clear,
+                    "range_ok": action.range_ok,
+                    "distance_to_target": action.distance_to_target,
+                    "weapon_id": action.weapon_id,
+                    "reason": "move_to_coin_while_shooting",
+                    **self._teacher_debug_fields(action.target_id),
+                }
+                self.logger.info(
+                    "move_to_coin_kite id=%s mode=%s reason=%s needed=%s detour=%.1f dx=%.3f dy=%.3f fire=%s",
+                    coin_target,
+                    self.coin_mode,
+                    self.last_action_summary["coin_decision_reason"],
+                    self.last_action_summary["coins_needed_for_next_shop"],
+                    self.last_action_summary["coin_detour"],
+                    dx,
+                    dy,
+                    action.fire,
+                )
+                if action.fire:
+                    now = time.time()
+                    if now - self.last_shot_at >= 0.2:
+                        self.logger.info(
+                            "shot fired target_id=%s weapon=%s aim=%.3f enemies=%s distance=%.1f los_clear=%s range_ok=%s reason=%s+coin",
+                            action.target_id,
+                            action.weapon_id or current_weapon,
+                            action.aim_angle,
+                            len(self.world.enemies),
+                            action.distance_to_target,
+                            action.los_clear,
+                            action.range_ok,
+                            action.reason,
+                        )
+                        self.last_shot_at = now
+                    for msg in self._shoot_messages(action, current_weapon):
+                        yield msg
+                yield self.proto.input(dx, dy)
+                return
+
             coin_target = self._priority_coin_target(hp, ammo, current_weapon)
             if coin_target is not None and not self._near_pickup(coin_target):
                 dx, dy = self._pickup_direction(coin_target)
                 decision = self._coin_decision(coin_target, hp, ammo, current_weapon)
+                action = self.teacher.choose(self.world)
                 self.last_action_summary = {
                     "objective_type": "pickup",
                     "objective_id": coin_target,
@@ -305,10 +368,14 @@ class LiveBot:
                     "physical_interact_allowed": False,
                     "dx": dx,
                     "dy": dy,
-                    "fire": False,
-                    "weapon_id": None,
+                    "fire": action.fire,
+                    "target_id": action.target_id,
+                    "los_clear": action.los_clear,
+                    "range_ok": action.range_ok,
+                    "distance_to_target": action.distance_to_target,
+                    "weapon_id": action.weapon_id,
                     "reason": "move_to_coin_for_shop",
-                    **self._teacher_debug_fields(None),
+                    **self._teacher_debug_fields(action.target_id),
                 }
                 self.logger.info(
                     "move_to_coin id=%s reason=%s needed=%s detour=%.1f dx=%.3f dy=%.3f",
@@ -319,6 +386,9 @@ class LiveBot:
                     dx,
                     dy,
                 )
+                if action.fire:
+                    for msg in self._shoot_messages(action, current_weapon):
+                        yield msg
                 yield self.proto.input(dx, dy)
                 return
 
@@ -497,11 +567,189 @@ class LiveBot:
             "projectile_count": len(self.world.projectiles),
             **payload,
         }
+        if kind == "action":
+            row["world_snapshot"] = self._debug_world_snapshot()
         self.record_file.write(json.dumps(row, separators=(",", ":")) + "\n")
         self.record_file.flush()
 
     def _summarize_packets(self, packets: list[str]) -> list[str]:
         return [protocol.packet_name(json.loads(packet).get("type")) for packet in packets]
+
+    def _debug_world_snapshot(self) -> dict:
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        room_id = int(self.world.current_room or 1)
+        room = None
+        try:
+            room = self.geometry.load_room(room_id)
+        except Exception:
+            room = None
+
+        door_point = self._current_door_point()
+        objective = self._current_objective_point()
+        target_id = self.last_action_summary.get("target_id") or self.last_action_summary.get("objective_id")
+
+        enemies = []
+        for enemy in sorted(self.world.enemies.values(), key=lambda e: int(e.get("entity_id", 0) or 0)):
+            ex = float(enemy.get("x", px) or px)
+            ey = float(enemy.get("y", py) or py)
+            label = spawn_label(room_id, enemy)
+            los_clear = None
+            line_crosses_water = None
+            if room is not None:
+                try:
+                    los_clear = room.line_of_fire_clear(px, py, ex, ey)
+                    line_crosses_water = room.line_crosses_water(px, py, ex, ey)
+                except Exception:
+                    los_clear = None
+                    line_crosses_water = None
+            enemies.append(
+                {
+                    "entity_id": int(enemy.get("entity_id", 0) or 0),
+                    "type": int(enemy.get("type", 0) or 0),
+                    "hp": int(enemy.get("hp", 0) or 0),
+                    "x": round(ex, 1),
+                    "y": round(ey, 1),
+                    "distance_to_player": round(math.hypot(ex - px, ey - py), 1),
+                    "distance_to_door": (
+                        round(math.hypot(ex - door_point[0], ey - door_point[1]), 1)
+                        if door_point is not None
+                        else None
+                    ),
+                    "los_clear": los_clear,
+                    "line_crosses_water": line_crosses_water,
+                    "spawn_label": label.get("spawn_label"),
+                    "spawn_group": label.get("spawn_group"),
+                    "spawn_phase": label.get("spawn_phase"),
+                    "distance_to_spawn_base": label.get("distance_to_spawn_base"),
+                    "is_fire_target": int(enemy.get("entity_id", -1) or -1) == self.teacher.fire_target_id,
+                    "is_route_target": int(enemy.get("entity_id", -1) or -1) == self.teacher.route_target_id,
+                    "is_action_target": int(enemy.get("entity_id", -1) or -1) == int(target_id or -1),
+                }
+            )
+
+        pickups = []
+        for pickup in sorted(self.world.pickups.values(), key=lambda p: int(p.get("entity_id", 0) or 0)):
+            pickup_id = int(pickup.get("entity_id", 0) or 0)
+            tx = float(pickup.get("x", px) or px)
+            ty = float(pickup.get("y", py) or py)
+            pickup_type = int(pickup.get("type", 0) or 0)
+            memory = self.world.coin_sources.get(pickup_id)
+            decision = None
+            if pickup_type == protocol.PICKUP_COIN:
+                try:
+                    hp = int(player.get("hp", 100) or 100)
+                    ammo = int(player.get("ammo", 9999) or 9999)
+                    weapon = int(player.get("weapon_id", 1) or 1)
+                    coin_decision = self._coin_decision(pickup_id, hp, ammo, weapon)
+                    decision = {
+                        "should_pick": coin_decision.should_pick,
+                        "reason": coin_decision.reason,
+                        "detour_px": round(coin_decision.detour_px, 1),
+                        "priority": round(coin_decision.priority, 1),
+                        "reaches_shop_threshold": self._coin_reaches_shop_threshold(hp, ammo, weapon),
+                        "shop_target": self._next_shop_target_name(hp, ammo, weapon),
+                    }
+                    decision.update(self.coin_score_debug.get(pickup_id, {}))
+                except Exception:
+                    decision = None
+            pickups.append(
+                {
+                    "entity_id": pickup_id,
+                    "type": pickup_type,
+                    "x": round(tx, 1),
+                    "y": round(ty, 1),
+                    "distance_to_player": round(math.hypot(tx - px, ty - py), 1),
+                    "distance_to_objective": (
+                        round(math.hypot(tx - objective[0], ty - objective[1]), 1)
+                        if objective is not None
+                        else None
+                    ),
+                    "near_enough_to_interact": self._pickup_distance(pickup_id) <= self.pickup_interact_distance,
+                    "claimed": pickup_id in self.claimed_pickups,
+                    "coin_source_enemy_id": memory.source_enemy_id if memory is not None else None,
+                    "coin_source_spawn_group": memory.source_spawn_group if memory is not None else None,
+                    "decision": decision,
+                }
+            )
+
+        doors = []
+        for door in sorted(self.world.doors.values(), key=lambda d: int(d.get("door_id", 0) or 0)):
+            door_id = int(door.get("door_id", 0) or 0)
+            dx = float(door.get("x", px) or px)
+            dy = float(door.get("y", py) or py)
+            doors.append(
+                {
+                    "door_id": door_id,
+                    "x": round(dx, 1),
+                    "y": round(dy, 1),
+                    "target_room": int(door.get("target_room", 0) or 0),
+                    "locked": bool(door.get("locked", False)),
+                    "distance_to_player": round(math.hypot(dx - px, dy - py), 1),
+                    "near_enough_to_enter": self._door_distance(door_id) <= self.door_enter_distance,
+                    "is_best_unlocked": door_id == self.world.best_unlocked_door(),
+                }
+            )
+
+        return {
+            "room_id": self.world.current_room,
+            "elapsed_ms": self.world.elapsed_ms,
+            "player": {
+                "x": round(px, 1),
+                "y": round(py, 1),
+                "hp": int(player.get("hp", 0) or 0),
+                "coins": int(player.get("coins", 0) or 0),
+                "weapon_id": int(player.get("weapon_id", 0) or 0),
+                "ammo": int(player.get("ammo", 0) or 0),
+                "speed_stacks": int(player.get("speed_stacks", 0) or 0),
+                "fire_rate_stacks": int(player.get("fire_rate_stacks", 0) or 0),
+                "damage_stacks": int(player.get("damage_stacks", 0) or 0),
+            },
+            "objective_point": (
+                {"x": round(objective[0], 1), "y": round(objective[1], 1)}
+                if objective is not None
+                else None
+            ),
+            "door_point": (
+                {"x": round(door_point[0], 1), "y": round(door_point[1], 1)}
+                if door_point is not None
+                else None
+            ),
+            "nearest_enemy_distance": round(self._nearest_enemy_distance(), 1),
+            "enemies": enemies,
+            "pickups": pickups,
+            "doors": doors,
+            "teacher_state": {
+                "route_target_id": self.teacher.route_target_id,
+                "fire_target_id": self.teacher.fire_target_id,
+                "route_mode": self.teacher.route_mode,
+                "goal_reason": self.teacher.goal_reason,
+                "current_goal_cell": self.teacher.current_goal_cell,
+                "macro_waypoint": self.teacher.macro_waypoint,
+                "stuck_ticks": self.teacher.stuck_ticks,
+                "failed_goal_count": sum(len(cells) for cells in self.teacher.failed_goal_cells.values()),
+            },
+            "wave_state": {
+                "initial_enemy_count": self.world.initial_enemy_count,
+                "current_wave_index": self.world.current_wave_index,
+                "wave_trigger_counts": self.world.wave_trigger_counts,
+                "wave_preposition_active": self.world.wave_preposition_active,
+                "predicted_wave_trigger_count": self.world.predicted_wave_trigger_count,
+            },
+        }
+
+    def _current_door_point(self) -> tuple[float, float] | None:
+        door_id = self.world.best_unlocked_door()
+        if door_id is None and self.world.doors:
+            door_id = min(self.world.doors)
+        if door_id is None:
+            return None
+        door = self.world.doors.get(int(door_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        return float(door.get("x", px) or px), float(door.get("y", py) or py)
 
     def _shoot_messages(self, action, current_weapon: int) -> list[str]:
         """Fire a same-tick multi-weapon volley.
@@ -805,6 +1053,8 @@ class LiveBot:
             return None
         if self.world.enemies:
             return None
+        if self.world.best_unlocked_door() is None:
+            return None
         room = int(self.world.current_room or 1)
         if room == 10:
             return None
@@ -835,6 +1085,155 @@ class LiveBot:
         ):
             return None
         return int(target["entity_id"])
+
+    def _greedy_kite_coin_target(self, hp: int, ammo: int, current_weapon: int) -> int | None:
+        if self.pickup_mode == "remote" or self.coin_mode == "cautious":
+            return None
+        if hp <= LOW_HEALTH_THRESHOLD:
+            return None
+        if not self.world.enemies:
+            return None
+        room_id = int(self.world.current_room or 1)
+        if room_id == 10:
+            return None
+        nearest_enemy = self._nearest_enemy_distance()
+        if nearest_enemy < 128.0:
+            return None
+
+        self.coin_score_debug.clear()
+        candidates: list[tuple[float, int]] = []
+        for pickup in self.world.pickups.values():
+            if int(pickup.get("type", 0) or 0) != protocol.PICKUP_COIN:
+                continue
+            pickup_id = int(pickup.get("entity_id", 0) or 0)
+            if pickup_id in self.claimed_pickups:
+                continue
+            scored = self._score_kite_coin(pickup_id, hp, ammo, current_weapon, nearest_enemy)
+            if scored is None:
+                continue
+            score, debug = scored
+            if self.coin_mode == "greedy-threshold" and not bool(debug.get("coin_reaches_shop_threshold")):
+                continue
+            self.coin_score_debug[pickup_id] = debug
+            candidates.append((score, pickup_id))
+
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
+    def _score_kite_coin(
+        self,
+        pickup_id: int,
+        hp: int,
+        ammo: int,
+        current_weapon: int,
+        nearest_enemy: float,
+    ) -> tuple[float, dict] | None:
+        pickup = self.world.pickups.get(int(pickup_id)) or {}
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        cx = float(pickup.get("x", px) or px)
+        cy = float(pickup.get("y", py) or py)
+        room_id = int(self.world.current_room or 1)
+
+        pickup_distance = math.hypot(cx - px, cy - py)
+        if room_id == 10 and pickup_distance > self.pickup_interact_distance:
+            return None
+
+        try:
+            room = self.geometry.load_room(room_id)
+            if room.blocked_aabb(cx, cy):
+                return None
+            cell = room._nearest_walkable_cell(cx, cy)
+            if cell is None or room.escape_space(cell) <= 2:
+                return None
+        except Exception as exc:
+            self.logger.debug("coin kite geometry fallback pickup_id=%s error=%s", pickup_id, exc)
+            return None
+
+        decision = self._coin_decision(pickup_id, hp, ammo, current_weapon)
+        if decision.reason == "skip_coin_breaks_locked_route":
+            return None
+
+        min_enemy_at_coin = min(
+            (
+                math.hypot(
+                    float(enemy.get("x", cx) or cx) - cx,
+                    float(enemy.get("y", cy) or cy) - cy,
+                )
+                for enemy in self.world.enemies.values()
+            ),
+            default=9999.0,
+        )
+        if min_enemy_at_coin < 150.0 and nearest_enemy >= 150.0:
+            return None
+
+        escape_alignment = self._coin_aligns_with_escape(cx, cy)
+        if nearest_enemy < 260.0 and escape_alignment < 0.2:
+            return None
+
+        detour = self._coin_detour_cost(pickup_id)
+        reaches_shop = self._coin_reaches_shop_threshold(hp, ammo, current_weapon)
+        if room_id == 10:
+            max_detour = 32.0
+        elif self.world.enemies:
+            max_detour = 260.0 if reaches_shop else 80.0
+        else:
+            max_detour = 340.0 if reaches_shop else 140.0
+            if room_id >= 8 and reaches_shop:
+                max_detour = 420.0
+        if detour > max_detour:
+            return None
+
+        score = 1000.0 if reaches_shop else 200.0
+        score += min(min_enemy_at_coin, 260.0) * 1.2
+        score -= detour * 2.0
+        score -= pickup_distance * 0.25
+        if pickup_distance <= COIN_ROUTE_NEAR_DISTANCE:
+            score += 300.0
+        if nearest_enemy < 260.0:
+            score += escape_alignment * 300.0
+
+        debug = {
+            "coin_mode": self.coin_mode,
+            "coin_escape_alignment": round(escape_alignment, 3),
+            "coin_min_enemy_distance_at_coin": round(min_enemy_at_coin, 1),
+            "coin_detour_px": round(detour, 1),
+            "coin_reaches_shop_threshold": reaches_shop,
+            "coin_shop_target": self._next_shop_target_name(hp, ammo, current_weapon),
+            "coin_decision_reason": "greedy_kite_coin",
+            "coin_score": round(score, 1),
+            "coin_max_detour_px": round(max_detour, 1),
+        }
+        return score, debug
+
+    def _coin_aligns_with_escape(self, coin_x: float, coin_y: float) -> float:
+        player = self.world.player or {}
+        px = float(player.get("x", 0.0) or 0.0)
+        py = float(player.get("y", 0.0) or 0.0)
+        nearest = min(
+            self.world.enemies.values(),
+            key=lambda enemy: math.hypot(
+                float(enemy.get("x", px) or px) - px,
+                float(enemy.get("y", py) or py) - py,
+            ),
+            default=None,
+        )
+        if nearest is None:
+            return 0.0
+        ex = float(nearest.get("x", px) or px)
+        ey = float(nearest.get("y", py) or py)
+        away_x = px - ex
+        away_y = py - ey
+        coin_dx = coin_x - px
+        coin_dy = coin_y - py
+        away_mag = math.hypot(away_x, away_y)
+        coin_mag = math.hypot(coin_dx, coin_dy)
+        if away_mag <= 1e-6 or coin_mag <= 1e-6:
+            return 0.0
+        return (away_x / away_mag) * (coin_dx / coin_mag) + (away_y / away_mag) * (coin_dy / coin_mag)
 
     def _coin_route_candidates(self, hp: int, ammo: int, current_weapon: int) -> list[dict]:
         candidates: list[dict] = []
@@ -892,17 +1291,21 @@ class LiveBot:
         current_weapon: int,
     ) -> dict:
         memory = self.world.coin_sources.get(int(pickup_id))
-        return {
+        debug = {
             "coin_pickup_id": pickup_id,
             "coin_source_enemy_id": memory.source_enemy_id if memory is not None else None,
             "coin_source_spawn_group": memory.source_spawn_group if memory is not None else None,
             "coin_detour_px": round(decision.detour_px, 1),
             "coin_decision_reason": decision.reason,
+            "coin_mode": self.coin_mode,
+            "coin_shop_target": self._next_shop_target_name(hp, ammo, current_weapon),
             "coin_reaches_shop_threshold": self._coin_reaches_shop_threshold(
                 hp, ammo, current_weapon
             ),
             "nearest_enemy_distance_at_coin_decision": round(self._nearest_enemy_distance(), 1),
         }
+        debug.update(self.coin_score_debug.get(int(pickup_id), {}))
+        return debug
 
     def _coin_reaches_shop_threshold(self, hp: int, ammo: int, current_weapon: int) -> bool:
         needed = self._coins_needed_for_next_shop_purchase(hp, ammo, current_weapon)
@@ -955,6 +1358,34 @@ class LiveBot:
         if no_enemies and limited_ammo_low and coins < 5:
             return 5 - coins
         return 0
+
+    def _next_shop_target_name(self, hp: int, ammo: int, current_weapon: int) -> str:
+        player = self.world.player or {}
+        coins = int(player.get("coins", 0) or 0)
+        speed = int(player.get("speed_stacks", 0) or 0)
+        fire_rate = int(player.get("fire_rate_stacks", 0) or 0)
+        damage = int(player.get("damage_stacks", 0) or 0)
+        room = int(self.world.current_room or 1)
+        no_enemies = not self.world.enemies
+        limited_ammo_low = self._limited_ammo_low_for_final(ammo, current_weapon)
+
+        if speed < 2 and coins < 10:
+            return "speed_2"
+        if fire_rate < 4 and coins < 15:
+            return "fire_rate_4"
+        if room >= 8 and room not in self.ammo_shop_rooms and limited_ammo_low and coins < 5:
+            return "ammo_final"
+        if fire_rate < 5 and coins < 15:
+            return "fire_rate_5"
+        if speed < 3 and coins < 10:
+            return "speed_3"
+        if speed < 4 and coins < 10:
+            return "speed_4"
+        if self._next_damage_stack_useful(damage) and coins < 20:
+            return "damage_breakpoint"
+        if no_enemies and limited_ammo_low and coins < 5:
+            return "ammo_safe"
+        return "none"
 
     def _limited_ammo_low_for_final(self, ammo: int, current_weapon: int) -> bool:
         if current_weapon in (WEAPON_RIFLE, WEAPON_SHOTGUN) and ammo <= LOW_AMMO_THRESHOLD:
@@ -1103,6 +1534,7 @@ class LiveBot:
             "room_plan_name": plan.name,
             "route_target_id": self.teacher.route_target_id,
             "fire_target_id": self.teacher.fire_target_id,
+            "farthest_from_door_target_id": self.teacher.farthest_from_door_target_id,
             "movement_goal_cell": self.teacher.current_goal_cell,
             "current_goal_cell": self.teacher.current_goal_cell,
             "goal_reason": self.teacher.goal_reason,
@@ -1110,6 +1542,15 @@ class LiveBot:
             "stuck_ticks": self.teacher.stuck_ticks,
             "failed_goal_count": sum(len(cells) for cells in self.teacher.failed_goal_cells.values()),
             "macro_waypoint": self.teacher.macro_waypoint,
+            "wave_preposition_active": self.world.wave_preposition_active,
+            "predicted_wave_index": self.world.current_wave_index,
+            "predicted_wave_trigger_count": self.world.predicted_wave_trigger_count,
+            "wave_preposition_goal": self.teacher.wave_preposition_goal,
+            "door_bias_blocked_by_far_cat": (
+                plan.combat_door_bias_enemy_count is not None
+                and len(self.world.enemies) <= plan.combat_door_bias_enemy_count
+                and self.teacher.far_from_door_cats_alive(self.world, plan.far_cat_door_distance_threshold)
+            ),
             "fire_target_spawn_label": fire_spawn.get("spawn_label"),
             "fire_target_spawn_group": fire_spawn.get("spawn_group"),
             "route_target_spawn_label": route_spawn.get("spawn_label"),
@@ -1175,6 +1616,11 @@ def main() -> None:
     parser.add_argument("--door-enter-distance", type=float, default=48.0)
     parser.add_argument("--pickup-mode", choices=("physical", "on-way", "remote"), default="physical")
     parser.add_argument("--pickup-interact-distance", type=float, default=PICKUP_INTERACT_DISTANCE)
+    parser.add_argument(
+        "--coin-mode",
+        choices=("cautious", "greedy-kite", "greedy-threshold"),
+        default="greedy-threshold",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1190,6 +1636,7 @@ def main() -> None:
         args.door_enter_distance,
         args.pickup_mode,
         args.pickup_interact_distance,
+        args.coin_mode,
     ).run()
 
 

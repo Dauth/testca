@@ -8,7 +8,7 @@ from typing import Any
 
 from .room_plans import RoomPlan, get_room_plan
 from .room_geometry import RoomGeometry
-from .spawn_catalog import ROOM_SPAWNS, spawn_group, spawn_groups
+from .spawn_catalog import EXTRA_SPAWN_GROUPS, ROOM_SPAWNS, spawn_group, spawn_groups
 from .world_model import WorldModel
 
 
@@ -30,7 +30,7 @@ ROOM10_SHOTGUN_MAX = 205.0
 ROOM10_RIFLE_MIN = 240.0
 ROOM10_RIFLE_MAX = 420.0
 TARGET_SWITCH_ADVANTAGE = 64.0
-DOOR_TARGET_SWITCH_ADVANTAGE = 32.0
+DOOR_TARGET_SWITCH_ADVANTAGE = 96.0
 RIVER_DOOR_CLOSE_DISTANCE = 520.0
 GOAL_REACHED_DISTANCE = 24.0
 GOAL_LOCK_TICKS = 18
@@ -89,12 +89,14 @@ class ScriptedTeacher:
         self.current_target_id: int | None = None
         self.route_target_id: int | None = None
         self.fire_target_id: int | None = None
+        self.farthest_from_door_target_id: int | None = None
         self.current_goal_cell: tuple[int, int] | None = None
         self.goal_target_id: int | None = None
         self.goal_expires_at_tick = 0
         self.goal_reason = ""
         self.route_mode = ""
         self.macro_waypoint: tuple[int, int] | None = None
+        self.wave_preposition_goal: tuple[float, float] | None = None
         self.failed_goal_cells: dict[int, set[tuple[int, int]]] = {}
         self.empty_weapons: set[int] = set()
         self.last_move: tuple[float, float] = (0.0, 0.0)
@@ -219,6 +221,7 @@ class ScriptedTeacher:
         if not enemies:
             self.route_target_id = None
             return None
+        self.route_mode = ""
 
         visible_close = [
             enemy
@@ -246,7 +249,7 @@ class ScriptedTeacher:
 
         locked = world.enemies.get(self.route_target_id or -1)
         preferred_pool = self.room_plan_target_pool(world, room, plan, px, py, enemies)
-        if door is not None and plan.clear_far_from_door_first:
+        if door is not None and plan.clear_far_from_door_first and plan.route_farthest_from_door:
             preferred = max(
                 preferred_pool,
                 key=lambda enemy: (
@@ -256,6 +259,9 @@ class ScriptedTeacher:
                     -int(enemy.get("entity_id", 0) or 0),
                 ),
             )
+            self.farthest_from_door_target_id = int(preferred["entity_id"])
+            if self.route_mode in ("", "visible_sweep", "combat"):
+                self.route_mode = "farthest_from_door"
         else:
             preferred = min(
                 preferred_pool,
@@ -265,6 +271,7 @@ class ScriptedTeacher:
                     int(enemy.get("entity_id", 0) or 0),
                 ),
             )
+            self.farthest_from_door_target_id = None
 
         if locked is not None:
             preferred_dist = distance(px, py, float(preferred["x"]), float(preferred["y"]))
@@ -279,7 +286,7 @@ class ScriptedTeacher:
             if door is not None and int(preferred["entity_id"]) != self.route_target_id:
                 door_advantage = (
                     distance(float(preferred["x"]), float(preferred["y"]), door[0], door[1])
-                    > distance(float(locked["x"]), float(locked["y"]), door[0], door[1])
+                    >= distance(float(locked["x"]), float(locked["y"]), door[0], door[1])
                     + DOOR_TARGET_SWITCH_ADVANTAGE
                 )
             blocked_too_long = (
@@ -295,7 +302,8 @@ class ScriptedTeacher:
             ):
                 preferred = locked
 
-        self.route_mode = "combat"
+        if self.route_mode == "":
+            self.route_mode = "combat"
         self.route_target_id = int(preferred["entity_id"])
         return preferred
 
@@ -385,7 +393,7 @@ class ScriptedTeacher:
                 self.route_mode = "spawn_flank_required"
                 return blocked_flank_group
 
-        if visible_enemies and not plan.clear_far_from_door_first:
+        if visible_enemies:
             self.route_mode = "visible_sweep"
             return visible_enemies
 
@@ -631,12 +639,12 @@ class ScriptedTeacher:
         if IDEAL_FIRE_MIN <= tdist <= IDEAL_FIRE_MAX and nearest_enemy_dist >= MIN_SHOOT_DISTANCE:
             plan = get_room_plan(world.current_room)
             self.current_goal_cell = None
-            wave_stage = self.next_wave_staging_direction(world, px, py)
-            if wave_stage is not None:
-                return self.avoid_trap_move(world, px, py, wave_stage[0], wave_stage[1])
             door_bias = self.combat_door_bias(world, px, py)
             if door_bias is not None:
                 return self.avoid_trap_move(world, px, py, door_bias[0], door_bias[1])
+            wave_bias = self.wave_preposition_direction(world, px, py)
+            if wave_bias is not None:
+                return self.avoid_trap_move(world, px, py, wave_bias[0], wave_bias[1])
             if plan.force_motion_when_ideal:
                 routed = self.route_to_safe_firing_position(
                     world,
@@ -692,88 +700,78 @@ class ScriptedTeacher:
             plan = get_room_plan(world.current_room)
             vx += door_bias[0] * plan.combat_door_bias_weight
             vy += door_bias[1] * plan.combat_door_bias_weight
-
-        wave_stage = self.next_wave_staging_direction(world, px, py)
-        if wave_stage is not None:
-            vx += wave_stage[0] * 0.9
-            vy += wave_stage[1] * 0.9
+        wave_bias = self.wave_preposition_direction(world, px, py)
+        if wave_bias is not None:
+            vx += wave_bias[0] * 0.35
+            vy += wave_bias[1] * 0.35
 
         mag = math.hypot(vx, vy)
         if mag < 1e-6:
             return 0.0, 0.0
         return self.avoid_trap_move(world, px, py, vx / mag, vy / mag)
 
-    def next_wave_staging_direction(
-        self, world: WorldModel, px: float, py: float
+    def wave_preposition_direction(self, world: WorldModel, px: float, py: float) -> tuple[float, float] | None:
+        plan = get_room_plan(world.current_room)
+        room_id = int(world.current_room or 0)
+        self.wave_preposition_goal = None
+        if not plan.preposition_waves or room_id <= 3 or room_id == 10:
+            return None
+        if not world.wave_preposition_active or len(world.enemies) > 2:
+            return None
+        nearest = min(
+            (distance(px, py, float(enemy["x"]), float(enemy["y"])) for enemy in world.enemies.values()),
+            default=9999.0,
+        )
+        if nearest < MIN_SHOOT_DISTANCE:
+            return None
+        target_spawn = self.next_wave_spawn_zone(world, plan, px, py)
+        if target_spawn is None:
+            return None
+        room = self.geometry.load_room(room_id)
+        routed = room.direction_to_reachable_near_point(px, py, target_spawn[0], target_spawn[1], 96.0)
+        if routed is None:
+            routed = room.direction_to_point(px, py, target_spawn[0], target_spawn[1])
+        if routed is None:
+            return None
+        self.wave_preposition_goal = target_spawn
+        self.macro_waypoint = (int(target_spawn[0] // TILE_SIZE), int(target_spawn[1] // TILE_SIZE))
+        return normalize_pair(*routed)
+
+    def next_wave_spawn_zone(
+        self, world: WorldModel, plan: RoomPlan, px: float, py: float
     ) -> tuple[float, float] | None:
         room_id = int(world.current_room or 0)
-        if room_id < 4 or room_id == 10 or len(world.enemies) > 2:
+        phases = sorted({spawn.phase for spawn in ROOM_SPAWNS.get(room_id, []) if spawn.phase.startswith("wave")})
+        if world.current_wave_index >= len(phases):
             return None
-        if not world.enemies:
+        phase = phases[world.current_wave_index]
+        candidates = [spawn for spawn in ROOM_SPAWNS.get(room_id, []) if spawn.phase == phase]
+        if not candidates:
             return None
-        nearest_enemy_dist = min(
-            distance(px, py, float(enemy["x"]), float(enemy["y"]))
-            for enemy in world.enemies.values()
-        )
-        if nearest_enemy_dist < MIN_SHOOT_DISTANCE:
-            return None
-        phase = self.next_unseen_wave_phase(world)
-        if phase is None:
-            return None
+        if plan.wave_spawn_groups_order:
+            for group in plan.wave_spawn_groups_order:
+                grouped = [spawn for spawn in candidates if group in self.spawn_groups_for_spawn(room_id, spawn)]
+                if grouped:
+                    candidates = grouped
+                    break
         door = self.known_door_point(world)
-        spawns = [spawn for spawn in ROOM_SPAWNS.get(room_id, []) if spawn.phase == phase]
-        if not spawns:
-            return None
         if door is not None:
-            target_spawn = max(
-                spawns,
-                key=lambda spawn: (
-                    distance(spawn.x, spawn.y, door[0], door[1]),
-                    -distance(px, py, spawn.x, spawn.y),
+            spawn = max(
+                candidates,
+                key=lambda item: (
+                    distance(item.x, item.y, door[0], door[1]),
+                    -distance(px, py, item.x, item.y),
                 ),
             )
         else:
-            target_spawn = min(spawns, key=lambda spawn: distance(px, py, spawn.x, spawn.y))
-        room = self.geometry.load_room(room_id)
-        routed = room.direction_to_reachable_near_point(px, py, target_spawn.x, target_spawn.y, 96.0)
-        if routed is None:
-            routed = room.direction_to_point(px, py, target_spawn.x, target_spawn.y)
-        if routed is None:
-            return None
-        self.macro_waypoint = (
-            int(max(0, min(39, target_spawn.x // TILE_SIZE))),
-            int(max(0, min(23, target_spawn.y // TILE_SIZE))),
-        )
-        return normalize_pair(*routed)
+            spawn = min(candidates, key=lambda item: distance(px, py, item.x, item.y))
+        return spawn.x, spawn.y
 
-    def next_unseen_wave_phase(self, world: WorldModel) -> str | None:
-        room_id = int(world.current_room or 0)
-        phases = sorted(
-            {
-                spawn.phase
-                for spawn in ROOM_SPAWNS.get(room_id, [])
-                if spawn.phase.startswith("wave")
-            }
-        )
-        if not phases:
-            return None
-        seen_entity_ids = set(world.enemies) | set(world.dead_entities)
-        for phase in phases:
-            ids = self.spawn_entity_ids_for_phase(room_id, phase)
-            if ids and not seen_entity_ids.intersection(ids):
-                return phase
-        return None
-
-    def spawn_entity_ids_for_phase(self, room_id: int, phase: str) -> set[int]:
-        ids: set[int] = set()
-        wave_idx = 0
-        for spawn in ROOM_SPAWNS.get(room_id, []):
-            if spawn.phase.startswith("wave"):
-                entity_id = 100000 + room_id * 1000 + wave_idx
-                if spawn.phase == phase:
-                    ids.add(entity_id)
-                wave_idx += 1
-        return ids
+    def spawn_groups_for_spawn(self, room_id: int, spawn: Any) -> set[str]:
+        groups = set(EXTRA_SPAWN_GROUPS.get(room_id, {}).get(spawn.label, set()))
+        if spawn.group:
+            groups.add(spawn.group)
+        return groups
 
     def only_big_cats_remain(self, world: WorldModel) -> bool:
         return bool(world.enemies) and all(
@@ -835,6 +833,10 @@ class ScriptedTeacher:
             return None
         if not world.enemies or len(world.enemies) > plan.combat_door_bias_enemy_count:
             return None
+        if plan.door_bias_requires_no_far_cats and self.far_from_door_cats_alive(
+            world, plan.far_cat_door_distance_threshold
+        ):
+            return None
         door = self.known_door_point(world)
         if door is None:
             return None
@@ -854,6 +856,15 @@ class ScriptedTeacher:
         if routed is None:
             return None
         return normalize_pair(*routed)
+
+    def far_from_door_cats_alive(self, world: WorldModel, threshold: float = 320.0) -> bool:
+        door = self.known_door_point(world)
+        if door is None:
+            return False
+        for enemy in world.enemies.values():
+            if distance(float(enemy["x"]), float(enemy["y"]), door[0], door[1]) >= threshold:
+                return True
+        return False
 
     def reposition_for_los(
         self, world: WorldModel, px: float, py: float, target: dict[str, Any]

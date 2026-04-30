@@ -27,6 +27,12 @@ class RoomPlan:
     failed_goal_blacklist: bool = False
     target_groups_order: list[str] = field(default_factory=list)
     door_bias_blocked_until_groups_clear: set[str] = field(default_factory=set)
+    route_farthest_from_door: bool = True
+    preposition_waves: bool = True
+    wave_preposition_margin: int = 1
+    wave_spawn_groups_order: list[str] = field(default_factory=list)
+    door_bias_requires_no_far_cats: bool = True
+    far_cat_door_distance_threshold: float = 520.0
     survival_mode: bool = False
     notes: str = ""
 
@@ -82,6 +88,7 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         obstacle_spawn_groups={"big_cat"},
         combat_door_bias_enemy_count=3,
         combat_door_bias_weight=0.20,
+        wave_spawn_groups_order=["wave_lower_right_group", "wave_left_group"],
         force_motion_when_ideal=True,
         notes="Handle kamikaze and runner threats first, then clear far/left wave cats before door.",
     ),
@@ -96,6 +103,7 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         obstacle_spawn_groups={"obstacle_group"},
         combat_door_bias_enemy_count=2,
         combat_door_bias_weight=0.35,
+        wave_spawn_groups_order=["wave_obstacle_group", "wave_river_group"],
         force_motion_when_ideal=True,
         notes="Clear solid-obstacle cats before using the river-to-door shortcut.",
     ),
@@ -109,6 +117,7 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         obstacle_spawn_groups=set(),
         combat_door_bias_enemy_count=2,
         combat_door_bias_weight=0.25,
+        wave_spawn_groups_order=["immediate_threat", "big_cat"],
         force_motion_when_ideal=True,
         notes="Clear far/right tanks and lower threats before committing to the door route.",
     ),
@@ -122,6 +131,7 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         immediate_threat_spawn_groups={"immediate_threat"},
         combat_door_bias_enemy_count=1,
         combat_door_bias_weight=0.15,
+        wave_spawn_groups_order=["wave_left_flank_group", "wave_upper_group"],
         force_motion_when_ideal=True,
         notes="Commit to persistent LOS/flank goals for obstacle-blocked targets.",
     ),
@@ -136,6 +146,7 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         combat_door_bias_enemy_count=2,
         combat_door_bias_weight=0.25,
         coin_path_distance=64.0,
+        wave_spawn_groups_order=["upper_wave", "right_wave"],
         force_motion_when_ideal=True,
         notes="Sweep left, mid, and far groups before strong door movement; avoid corner chases.",
     ),
@@ -150,6 +161,7 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         obstacle_spawn_groups={"big_cat"},
         combat_door_bias_enemy_count=2,
         combat_door_bias_weight=0.15,
+        wave_spawn_groups_order=["upper_left_wave", "upper_mid_wave", "upper_right_wave"],
         force_motion_when_ideal=True,
         notes="Preserve HP before the final room; prioritize kamikaze and runner threats.",
     ),
@@ -163,6 +175,8 @@ ROOM_PLANS: dict[int, RoomPlan] = {
         immediate_threat_spawn_groups={"immediate_threat", "bottom_threat_group"},
         boss_spawn_groups={"boss_group"},
         kite_loop=[(16, 8), (21, 8), (21, 14), (16, 14)],
+        preposition_waves=False,
+        door_bias_requires_no_far_cats=False,
         force_motion_when_ideal=True,
         survival_mode=True,
         notes="Prioritize open-area kiting and high escape-space firing cells.",

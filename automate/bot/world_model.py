@@ -5,7 +5,7 @@ import math
 from typing import Any
 
 from . import protocol
-from .spawn_catalog import spawn_label
+from .spawn_catalog import ENTITY_SPAWN_BY_ID, ROOM_SPAWNS, spawn_label
 
 
 @dataclass
@@ -46,6 +46,11 @@ class WorldModel:
     last_error: str | None = None
     recent_enemy_deaths: list[dict[str, Any]] = field(default_factory=list)
     coin_sources: dict[int, CoinMemory] = field(default_factory=dict)
+    initial_enemy_count: int = 0
+    wave_trigger_counts: list[int] = field(default_factory=list)
+    current_wave_index: int = 0
+    wave_preposition_active: bool = False
+    predicted_wave_trigger_count: int | None = None
 
     def apply(self, env: dict[str, Any]) -> None:
         typ = env.get("type")
@@ -87,6 +92,7 @@ class WorldModel:
                 velocities[entity_id] = (vx, vy)
             self.enemies = new_enemies
             self.enemy_velocities = velocities
+            self._update_wave_state()
             self.pickups = {
                 int(p["entity_id"]): p
                 for p in data.get("pickups", [])
@@ -140,6 +146,23 @@ class WorldModel:
         self.current_room = room.get("room_index")
         self.previous_enemies = self.enemies
         self.enemies = {int(e["entity_id"]): e for e in room.get("enemies", [])}
+        self.initial_enemy_count = len(self.enemies)
+        wave_phases = {
+            spawn.phase
+            for spawn in ROOM_SPAWNS.get(int(self.current_room or 0), [])
+            if spawn.phase.startswith("wave")
+        }
+        self.wave_trigger_counts = (
+            [
+                max(1, int(math.floor(self.initial_enemy_count * 0.66))),
+                max(1, int(math.floor(self.initial_enemy_count * 0.33))),
+            ]
+            if self.initial_enemy_count and wave_phases
+            else []
+        )
+        self.current_wave_index = 0
+        self.wave_preposition_active = False
+        self.predicted_wave_trigger_count = self.wave_trigger_counts[0] if self.wave_trigger_counts else None
         self.enemy_velocities = {}
         self.pickups = {int(p["entity_id"]): p for p in room.get("pickups", [])}
         self.projectiles = {}
@@ -150,6 +173,23 @@ class WorldModel:
         self.dead_entities = set()
         self.recent_enemy_deaths = []
         self.coin_sources = {}
+
+    def _update_wave_state(self) -> None:
+        room_id = int(self.current_room or 0)
+        seen_wave_phases = {
+            spawn.phase
+            for entity_id in set(self.enemies) | set(self.dead_entities)
+            for spawn in [ENTITY_SPAWN_BY_ID.get(entity_id)]
+            if spawn is not None and spawn.room == room_id and spawn.phase.startswith("wave")
+        }
+        self.current_wave_index = max(self.current_wave_index, len(seen_wave_phases))
+        if self.current_wave_index < len(self.wave_trigger_counts):
+            trigger = self.wave_trigger_counts[self.current_wave_index]
+            self.predicted_wave_trigger_count = trigger
+            self.wave_preposition_active = len(self.enemies) <= trigger + 1
+        else:
+            self.predicted_wave_trigger_count = None
+            self.wave_preposition_active = False
 
     def _link_coin_sources(self) -> None:
         room_id = int(self.current_room or 0)
